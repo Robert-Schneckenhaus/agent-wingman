@@ -37,3 +37,9 @@ uv venv && uv pip install -e ".[dev]"   # or: python -m venv .venv && pip instal
   backend-specific search features go behind a backend interface (CONCEPT.md 4.6).
 - Cross-references that should survive re-indexing or be shared (doc links, notes)
   use `stable_key` / `repo:path`, not numeric IDs.
+
+## Commits
+
+- Author and committer: `Robert Schneckenhaus <robert@studio-robert.com>`
+  (`git config user.name "Robert Schneckenhaus"` / `git config user.email "robert@studio-robert.com"`).
+- No `Co-Authored-By` or other AI attribution trailers in commit messages or PR descriptions.
