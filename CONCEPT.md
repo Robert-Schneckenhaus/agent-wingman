@@ -76,12 +76,20 @@ Begründung: `tree-sitter` hat gute Python-Bindings (`tree-sitter-language-pack`
   1. **TypeScript** (inkl. TSX) und **C#**: Prototyp
   2. **JavaScript** (inkl. JSX): fällt fast gratis mit TS ab, gleiche Grammatik-Familie
   3. **Java**, **Python**, **PHP**
-  4. später nach Bedarf: Go, Kotlin, C/C++, Rust
+  4. **C und C++**: fest eingeplant, direkt nach Stufe 3
+  5. später nach Bedarf: Go, Kotlin, Rust, Swift …
 - Sprachspezifische Besonderheiten, die der Extractor kennen muss:
   - **C#**: `namespace`/file-scoped namespaces, `partial class` (ein Symbol über mehrere Dateien), Properties mit Getter/Setter, Extension Methods, Attribute (`[HttpGet("x")]`, `[Fact]`/`[Test]` für Testerkennung), XML-Doc-Kommentare (`/// <summary>`), Interfaces und DI-Registrierungen (`services.AddScoped<IFoo, Foo>()` → Kante *implements/bound_to*).
   - **TypeScript**: `export`/`export default`/Re-Exports (`export * from`), Barrel-Dateien (`index.ts`), Pfad-Aliase aus `tsconfig.json` (`paths`, `baseUrl`), Arrow Functions als `const foo = () => …`, Klassen-Felder, Decorators (Angular/NestJS), JSDoc/TSDoc, React-Komponenten (Funktion, die JSX zurückgibt → `kind = component`).
   - **PHP**: Namespaces + `use`, Composer-Autoload (PSR-4) für Import-Auflösung, PHPDoc.
-- **Präzise Auflösung (optional, Phase 6):** für C# ein kleiner Roslyn-basierter Helfer (`dotnet tool`) bzw. `scip-dotnet`, für TS/JS `scip-typescript` bzw. die TypeScript Compiler API. Tree-sitter bleibt die Basis, die immer funktioniert, auch ohne Build.
+  - **C/C++**: Hier liegen die meisten Fallstricke.
+    - **Deklaration und Definition** sind getrennt (Header `.h/.hpp` und Source `.c/.cpp`). Ein Symbol bekommt deshalb mehrere Orte (`symbol_locations` mit `role = declaration|definition`), und die Suche liefert beide.
+    - **`#include`-Auflösung** über `compile_commands.json` (CMake, Bear, Meson) bzw. konfigurierbare Include-Pfade. Ohne diese Angaben gilt eine Heuristik über Dateinamen.
+    - **Präprozessor:** Makros werden als eigene Symbole (`kind = macro`) erfasst. Code in `#ifdef`-Zweigen wird indexiert, aber mit der Bedingung markiert, statt verworfen zu werden.
+    - **C++-Spezifika:** Namespaces, Klassen und Structs, Überladungen (die Signatur gehört zum `stable_key`), Templates, `virtual`/`override` (→ `symbol_edges` vom Typ `overrides`), Operatoren und Out-of-Class-Definitionen (`void Foo::bar() {…}` → Methode von `Foo`).
+    - **Doku:** Doxygen-Kommentare (`/** */`, `///`, `//!`), wahlweise am Header oder an der Implementierung.
+    - **Indirekte Aufrufe** (Funktionszeiger, Callbacks, virtuelle Aufrufe) lassen sich nur heuristisch auflösen und bekommen eine niedrige Konfidenz.
+- **Präzise Auflösung (optional, Phase 7):** für C# ein kleiner Roslyn-basierter Helfer (`dotnet tool`) bzw. `scip-dotnet`, für TS/JS `scip-typescript` bzw. die TypeScript Compiler API, für C/C++ `scip-clang` bzw. clangd/libclang auf Basis von `compile_commands.json`. Gerade bei C++ (Templates, Überladungen, Makros) bringt das am meisten. Tree-sitter bleibt die Basis, die immer funktioniert, auch ohne Build.
 
 ### 3.3 Extractor – was pro Datei herausgezogen wird
 
@@ -201,7 +209,7 @@ CREATE TABLE symbols (
   id              INTEGER PRIMARY KEY,
   file_id         INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
   parent_id       INTEGER REFERENCES symbols(id) ON DELETE CASCADE,
-  kind            TEXT NOT NULL,     -- class|function|method|interface|enum|const|module|property|...
+  kind            TEXT NOT NULL,     -- class|struct|function|method|interface|enum|const|module|property|macro|...
   name            TEXT NOT NULL,
   qualified_name  TEXT NOT NULL,     -- pkg.module.Class.method
   signature       TEXT,
@@ -234,6 +242,15 @@ CREATE TABLE refs (
 );
 CREATE INDEX ix_refs_to   ON refs(to_symbol_id);
 CREATE INDEX ix_refs_from ON refs(from_symbol_id);
+
+-- Weitere Orte eines Symbols: C/C++ Deklaration (Header) vs. Definition,
+-- C# partial class über mehrere Dateien. Der Hauptort steht in symbols.
+CREATE TABLE symbol_locations (
+  symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+  file_id   INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  role      TEXT NOT NULL,             -- declaration|definition|partial
+  start_line INTEGER, end_line INTEGER
+);
 
 CREATE TABLE symbol_edges (            -- strukturelle Beziehungen
   src_id INTEGER REFERENCES symbols(id) ON DELETE CASCADE,
@@ -480,7 +497,7 @@ Der Prototyp ist auf **einen Entwickler mit lokaler SQLite-DB** ausgelegt. Das D
 | **4 – Semantik** | Embeddings (lokal), sqlite-vec, Hybrid-Suche + RRF + Graph-Expansion | Bug-Report → relevante Stellen |
 | **5 – Summaries** | LLM-Enricher bottom-up (Anthropic, kleines Modell, Opt-in), Cache, Budget, Datei-/Modul-Summaries | Undokumentierter Code wird durchsuchbar |
 | **6 – Externe Doku** | PDF/URL/MD/OpenAPI-Ingest, Chunking, Auto-Linking | Spezifikationen hängen am Code |
-| **7 – Breite** | JavaScript, dann Java, Python, PHP; SCIP/Roslyn-Adapter; Notes | Alle Zielsprachen abgedeckt |
+| **7 – Breite** | JavaScript, dann Java, Python, PHP, dann **C/C++** (inkl. `compile_commands.json`, Header/Source-Zuordnung); SCIP/Roslyn/clang-Adapter; Notes | Alle Zielsprachen abgedeckt |
 | **8 – Teilen** | Export/Import-Format, CI-Build, PostgreSQL-Backend (siehe Abschnitt 10) | Team nutzt einen gemeinsamen Index |
 | **9 – Evaluation** | Benchmark: echte Issues/Commits, Recall@k der geänderten Dateien (läuft ab Phase 2 mit, wird hier ausgebaut) | Messbare Qualität, Tuning |
 
@@ -568,5 +585,5 @@ Offene Punkte zum Weiterdiskutieren:
 | 1 | Embedding-Modell | **Lokal als Default** (`sentence-transformers`, code-fähiges Modell), API-Provider optional per Config |
 | 2 | LLM-Summaries | **Anthropic als Default**, kleines und günstiges Modell, **Opt-in** per Config, mit Budget-Limit. Andere Provider (OpenAI-kompatibel, Ollama) über das Provider-Interface |
 | 3 | Multi-Repo | **Ja, von Anfang an**: Workspaces mit mehreren Repos in einer DB, Kanten über Repo-Grenzen (Pakete, HTTP-Endpunkte), siehe 4.3 |
-| 4 | Sprachen | **TypeScript + C#** im Prototyp, danach **JavaScript**, dann **Java, Python, PHP** |
+| 4 | Sprachen | **TypeScript + C#** im Prototyp, danach **JavaScript**, dann **Java, Python, PHP**, danach **C und C++**. Weitere Sprachen (Go, Rust, Kotlin …) bleiben über tree-sitter-Queries jederzeit nachrüstbar |
 | 5 | Teilen | **Prototyp: ein Dev, lokale SQLite.** Datenmodell wird teilbar ausgelegt (inhaltsadressiert, `stable_key`). Teamlösung siehe Brainstorming in Abschnitt 10, Entscheidung später |
