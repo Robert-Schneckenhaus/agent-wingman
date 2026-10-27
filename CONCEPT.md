@@ -268,7 +268,8 @@ CREATE TABLE imports (
 
 -- Externe Dokumentation
 CREATE TABLE documents (
-  id INTEGER PRIMARY KEY, repo_id INTEGER REFERENCES repositories(id),
+  id INTEGER PRIMARY KEY, workspace_id INTEGER REFERENCES workspaces(id),
+  repo_id INTEGER REFERENCES repositories(id),   -- optional: Doku kann zu keinem einzelnen Repo gehören
   source_type TEXT,          -- pdf|url|markdown|html|openapi
   uri TEXT NOT NULL, title TEXT, content_hash TEXT,
   fetched_at TIMESTAMP, metadata_json TEXT
@@ -285,7 +286,7 @@ CREATE TABLE doc_chunks (
 CREATE TABLE doc_links (
   chunk_id INTEGER REFERENCES doc_chunks(id) ON DELETE CASCADE,
   target_type TEXT NOT NULL,     -- symbol|file|directory
-  target_id INTEGER, target_path TEXT,
+  target_key TEXT NOT NULL,      -- symbol stable_key oder repo:path (keine IDs → teilbar, überlebt Re-Index)
   link_source TEXT,              -- manual|name_match|semantic
   confidence REAL DEFAULT 1.0
 );
@@ -309,7 +310,8 @@ CREATE TABLE summary_cache (
 
 -- Freie Notizen / Wissen vom Agent oder Menschen ("Gotchas")
 CREATE TABLE notes (
-  id INTEGER PRIMARY KEY, target_type TEXT, target_id INTEGER, target_path TEXT,
+  id INTEGER PRIMARY KEY, workspace_id INTEGER REFERENCES workspaces(id),
+  target_type TEXT, target_key TEXT,  -- wie doc_links
   author TEXT, text TEXT, created_at TIMESTAMP
 );
 ```
