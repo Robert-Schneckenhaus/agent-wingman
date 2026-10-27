@@ -7,7 +7,7 @@ from datetime import datetime
 
 from sqlalchemy import Connection, func, insert, select
 
-from wingman.storage.schema import files, repositories, workspaces
+from wingman.storage.schema import files, notes, repositories, workspaces
 
 
 class StoreError(Exception):
@@ -97,3 +97,65 @@ def remove_repository(conn: Connection, workspace_id: int, name: str) -> None:
     )
     if result.rowcount == 0:
         raise StoreError(f"No repository named '{name}'.")
+
+
+# --- notes -----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Note:
+    id: int
+    target_type: str | None
+    target_key: str | None
+    """Symbol ``stable_key`` or ``repo:path``; survives re-indexing."""
+    author: str | None
+    text: str
+    created_at: datetime
+
+
+def add_note(
+    conn: Connection,
+    workspace_id: int,
+    text: str,
+    *,
+    target_type: str | None = None,
+    target_key: str | None = None,
+    author: str | None = None,
+) -> int:
+    if not text.strip():
+        raise StoreError("A note needs some text.")
+    return conn.execute(
+        insert(notes).values(
+            workspace_id=workspace_id,
+            target_type=target_type,
+            target_key=target_key,
+            author=author,
+            text=text.strip(),
+        )
+    ).inserted_primary_key[0]
+
+
+def list_notes(
+    conn: Connection, workspace_id: int, target_keys: list[str] | None = None
+) -> list[Note]:
+    query = select(
+        notes.c.id,
+        notes.c.target_type,
+        notes.c.target_key,
+        notes.c.author,
+        notes.c.text,
+        notes.c.created_at,
+    ).where(notes.c.workspace_id == workspace_id)
+    if target_keys is not None:
+        if not target_keys:
+            return []
+        query = query.where(notes.c.target_key.in_(target_keys))
+    return [Note(**row._mapping) for row in conn.execute(query.order_by(notes.c.id))]
+
+
+def delete_note(conn: Connection, workspace_id: int, note_id: int) -> None:
+    result = conn.execute(
+        notes.delete().where(notes.c.workspace_id == workspace_id, notes.c.id == note_id)
+    )
+    if result.rowcount == 0:
+        raise StoreError(f"No note #{note_id}.")

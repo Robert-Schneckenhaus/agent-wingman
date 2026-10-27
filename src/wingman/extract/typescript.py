@@ -13,6 +13,9 @@ from wingman.extract.model import Extraction, Import
 _MODIFIER_TOKENS = {"static", "async", "readonly", "abstract", "override", "declare", "get", "set"}
 _FUNCTION_VALUES = {"arrow_function", "function_expression", "function", "generator_function"}
 _JSX_NODES = {"jsx_element", "jsx_self_closing_element", "jsx_fragment"}
+# Jest/Mocha/Vitest/Jasmine blocks that become symbols, so tests are findable by name
+_TEST_SUITES = {"describe", "context", "suite", "fdescribe", "xdescribe"}
+_TEST_CASES = {"it", "test", "specify", "fit", "xit"}
 _TS_TYPE_SKIP = re.compile(r"^[A-Z]$")  # generic type parameters like T
 
 
@@ -445,12 +448,43 @@ class TypeScriptExtractor(ExtractorBase):
 
     def on_call_expression(self, node: Node, ctx: _Ctx) -> None:
         function = node.child_by_field_name("function")
+        if function is not None and self.test_block(node, function, ctx):
+            return
         if function is not None:
             if function.type == "identifier":
                 self.add_ref(function, "call", self.text(function), ctx.symbol)
             elif function.type == "member_expression":
                 self.member_ref(function, "call", ctx)
         self.visit_children(node, ctx)
+
+    def test_block(self, node: Node, function: Node, ctx: _Ctx) -> bool:
+        """``describe("x", () => ...)`` / ``it.only("y", ...)`` -> test_suite / test symbol."""
+        callee = function
+        if callee.type == "member_expression":  # it.only, describe.skip, test.each(...)
+            callee = callee.child_by_field_name("object")
+        if callee is None or callee.type != "identifier":
+            return False
+        name = self.text(callee)
+        if name not in _TEST_SUITES and name not in _TEST_CASES:
+            return False
+        arguments = node.child_by_field_name("arguments")
+        args = arguments.named_children if arguments is not None else []
+        if len(args) < 2 or args[0].type not in ("string", "template_string"):
+            return False
+        callback = next((a for a in args[1:] if a.type in _FUNCTION_VALUES), None)
+        if callback is None:
+            return False
+        title = self.text(args[0])[1:-1]
+        index = self.add_symbol(
+            node,
+            "test_suite" if name in _TEST_SUITES else "test",
+            title,
+            ctx.symbol,
+            qualified_prefix=ctx.prefix,
+            signature=collapse(f"{self.text(function)}({self.text(args[0])})", 160),
+        )
+        self.function_body(callback, ctx, index)
+        return True
 
     def on_new_expression(self, node: Node, ctx: _Ctx) -> None:
         constructor = node.child_by_field_name("constructor")

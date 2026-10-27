@@ -104,6 +104,45 @@ def _walk_files(root: Path, ignore: pathspec.GitIgnoreSpec) -> Iterator[str]:
             yield prefix + name
 
 
+def _git_ignored(root: Path, paths: list[str]) -> set[str]:
+    if not paths or git.toplevel(root) is None:
+        return set()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "check-ignore", "--stdin", "-z"],
+            input="\0".join(paths).encode(),
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return set()
+    return {p for p in result.stdout.decode("utf-8", errors="replace").split("\0") if p}
+
+
+def _source(root: Path, rel: str, ignore: pathspec.GitIgnoreSpec) -> SourceFile | None:
+    spec = spec_for(rel)
+    if spec is None or ignore.match_file(rel):
+        return None
+    abs_path = root / rel
+    try:
+        size = abs_path.stat().st_size
+    except OSError:  # deleted but still tracked, broken symlink, ...
+        return None
+    if size > MAX_FILE_BYTES or not abs_path.is_file():
+        return None
+    return SourceFile(rel, abs_path, spec.name)
+
+
+def scan_paths(root: Path, paths: list[str]) -> list[SourceFile]:
+    """Like ``scan`` but only for the given repository-relative paths."""
+    root = root.resolve()
+    ignore = _load_ignore(root)
+    normalized = sorted({Path(p).as_posix().removeprefix("./") for p in paths})
+    git_ignored = _git_ignored(root, normalized)
+    found = (_source(root, rel, ignore) for rel in normalized if rel not in git_ignored)
+    return [f for f in found if f is not None]
+
+
 def scan(root: Path) -> list[SourceFile]:
     """Return indexable source files below ``root``, sorted by path."""
     root = root.resolve()
@@ -112,18 +151,5 @@ def scan(root: Path) -> list[SourceFile]:
     if candidates is None:
         candidates = list(_walk_files(root, ignore))
 
-    files: list[SourceFile] = []
-    for rel in candidates:
-        spec = spec_for(rel)
-        if spec is None or ignore.match_file(rel):
-            continue
-        abs_path = root / rel
-        try:
-            size = abs_path.stat().st_size
-        except OSError:  # deleted but still tracked, broken symlink, ...
-            continue
-        if size > MAX_FILE_BYTES or not abs_path.is_file():
-            continue
-        files.append(SourceFile(rel, abs_path, spec.name))
-    files.sort(key=lambda f: f.path)
-    return files
+    found = (_source(root, rel, ignore) for rel in candidates)
+    return sorted((f for f in found if f is not None), key=lambda f: f.path)

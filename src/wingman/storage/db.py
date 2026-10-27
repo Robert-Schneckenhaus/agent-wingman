@@ -33,7 +33,8 @@ def create_db_engine(url: str) -> Engine:
     if database and database != ":memory:":
         Path(database).parent.mkdir(parents=True, exist_ok=True)
 
-    engine = create_engine(url)
+    # hooks and the MCP server may write while another process reads or writes
+    engine = create_engine(url, connect_args={"timeout": 30})
 
     @event.listens_for(engine, "connect")
     def _sqlite_pragmas(dbapi_connection, _record):

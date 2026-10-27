@@ -10,6 +10,10 @@ from tree_sitter import Language, Parser
 
 from wingman.extract.model import Extraction
 
+# Bump when extractors change what they produce: it is part of every file's content
+# hash, so the next `wingman index` re-parses all files.
+EXTRACTOR_VERSION = "2"
+
 
 @dataclass(frozen=True)
 class LanguageSpec:

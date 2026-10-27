@@ -6,6 +6,7 @@ import pytest
 from click.testing import CliRunner
 from sqlalchemy import Engine
 
+from wingman.cli import main
 from wingman.config import ENV_DB, ENV_HOME
 from wingman.indexer import index_repository
 from wingman.storage import db, store
@@ -54,3 +55,25 @@ def indexed(tmp_path) -> IndexedWorkspace:
     for name in ("ts_app", "cs_app"):
         workspace.reindex(name)
     return workspace
+
+
+@pytest.fixture
+def ws(tmp_path, runner, monkeypatch):
+    """CLI workspace with both fixture repositories added and indexed."""
+    for name in ("ts_app", "cs_app"):
+        shutil.copytree(FIXTURES / name, tmp_path / name)
+    monkeypatch.chdir(tmp_path)
+
+    def run(*args, ok=True):
+        result = runner.invoke(main, list(args))
+        if ok:
+            assert result.exit_code == 0, result.output
+        return result
+
+    run("init", "--workspace", "demo")
+    run("repo", "add", "ts_app")
+    run("repo", "add", "cs_app")
+    result = run("index")
+    assert "ts_app: 7 indexed" in result.output
+    assert "cs_app: 6 indexed" in result.output
+    return run

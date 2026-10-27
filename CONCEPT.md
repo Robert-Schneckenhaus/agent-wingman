@@ -393,6 +393,16 @@ Für eine Anfrage wie einen Bug Report („Beim Export als PDF fehlt bei Rechnun
 5. **Re-Ranking** (optional): ein Cross-Encoder oder LLM-Rerank der Top-30.
 6. **Context Pack** bauen (siehe unten), mit Token-Budget.
 
+> *Umgesetzt in Phase 2* (`src/wingman/context.py`, ohne die semantische Suche aus Phase 4):
+> - **Stacktrace-Frames** in C#- und JS/TS-Format, auch `pfad:zeile`. Windows- und `webpack://`-Pfade werden normalisiert. Pfade von fremden Maschinen werden über immer kürzere Suffixe gefunden (`D:\ci\work\Api\X.cs` → `Api/X.cs`). Die Fehlerstelle ist das innerste Symbol an der Zeile.
+> - **Veraltete Zeilennummern:** Nennt der Frame einen anderen Methodennamen als das Symbol an der Zeile, stammt der Trace von einem älteren Build. Dann gewinnt der Name, und das Symbol an der Zeile bleibt nur ein schwacher Kandidat.
+> - **Weitere Signale:** im Text genannte Bezeichner (Backticks, `CamelCase`, `snake_case`, `A.B`, `name()`) und genannte Dateien.
+> - **Volltext:** FTS5 mit Porter-Stemming („cancels“ findet „Cancelled“) über den Prosa-Teil ohne Frame-Zeilen.
+> - **Graph-Expansion:** 1 Hop zu Callern und Callees. Der Bonus ist gedeckelt, damit Nachbarn nie Symbole mit direkter Evidenz überholen.
+> - **Diversifizierung:** höchstens 2 Member pro Klasse, Abwertung von Membern, die nur über den Klassennamen passen, Dämpfung gleichnamiger Kopien aus mehreren Services.
+> - Fusion über gewichtete Summen statt RRF.
+> - **Bekannte Grenze:** Prosa ohne Bezeichner, die nah an *anderen* Klassennamen formuliert ist, findet die eigentliche Logik oft erst über die Graph-Expansion. Genau dafür ist die semantische Suche in Phase 4 gedacht.
+
 ### 5.2 Context Pack – Ausgabeformat für Agents
 
 Kompakt, zitierbar, mit Pfad und Zeilen, damit der Agent gezielt `Read` aufrufen kann:
@@ -413,6 +423,8 @@ Kompakt, zitierbar, mit Pfad und Zeilen, damit der Agent gezielt `Read` aufrufen
 ```
 
 Optionen: `--with-code` (Body inline, gekürzt), `--budget 4000` (Tokens), `--format json|markdown`.
+
+*Umgesetzt:* `wingman context "<text>"` bzw. `--file bug.txt` (`--code`, `--budget`, `--json`). Jeder Eintrag zeigt zusätzlich, *warum* er passt („stack frame Order.cs:120“, „mentions `X`“, „text match“, „calls Y“). Außerdem enthält er Tests, die das Symbol über bis zu 2 Aufrufe erreichen, und Notizen zu Symbol, Datei oder Verzeichnis.
 
 ---
 
@@ -435,6 +447,8 @@ wingman stats | wingman doctor
 wingman serve --mcp                  # MCP-Server (stdio oder HTTP)
 ```
 
+*Umgesetzt (Phase 1–2):* `init`, `repo add|list|remove`, `index [--full]`, `reindex <dateien>`, `status`, `search`, `context`, `symbol`, `callers`, `callees`, `tests`, `outline`, `note add|list|remove`, `mcp` (stdio), `hook post-edit|session-start` und `claude install|uninstall`. Alle Abfragen können `--json` ausgeben.
+
 ### 6.2 MCP-Server (Hauptintegration für Claude Code)
 
 | Tool                   | Zweck                                                         |
@@ -445,15 +459,24 @@ wingman serve --mcp                  # MCP-Server (stdio oder HTTP)
 | `get_callers` / `get_callees` | Call-Graph mit Tiefe                                  |
 | `get_file_outline`     | Symbolbaum einer Datei ohne Bodies                            |
 | `find_tests_for`       | Tests, die ein Symbol (indirekt) aufrufen                     |
-| `search_docs`          | Nur externe Doku durchsuchen                                  |
+| `search_docs`          | Nur externe Doku durchsuchen *(Phase 6)*                      |
 | `add_note`             | Agent hinterlegt Erkenntnisse für spätere Sessions            |
-| `reindex_files`        | Nach Änderungen gezielt neu indexieren                        |
+| `reindex`              | Nach Änderungen gezielt (Dateien) oder komplett inkrementell neu indexieren |
 
-Einbindung: `claude mcp add wingman -- wingman serve --mcp`.
+*Umgesetzt mit dem offiziellen Python-MCP-SDK (2.x)* in `src/wingman/mcp_server.py`, inklusive Server-Instructions und Tool-Annotations (read-only). Die Ausgaben sind kompakter Text mit `repo:pfad:start-ende`. Unbekannte oder mehrdeutige Namen liefern Hinweise statt Fehler.
+
+Einbindung: `wingman claude install [projekt]` (siehe 6.3), manuell `claude mcp add wingman -- wingman mcp`.
 
 ### 6.3 Claude-Code-Integration darüber hinaus
 
 - **Hooks**: Ein `PostToolUse`-Hook auf `Edit`/`Write` ruft `wingman reindex <file>` auf. Ein `SessionStart`-Hook führt `wingman index --incremental` aus.
+  - *Umgesetzt:*
+    - `wingman hook post-edit` liest den Hook-Payload von stdin und indexiert nur die bearbeitete Datei: ca. 20 ms plus Resolver-Lauf, der bei unveränderten Dateien entfällt.
+    - `wingman hook session-start` bringt alle Repos auf Stand und gibt dem Agenten einen Satz Kontext („Index bereit, nutze find_relevant_for_task …“).
+    - Hooks scheitern nie laut: Exit-Code 0, Fehler nur auf stderr.
+  - `wingman claude install [projekt]` richtet MCP-Server, Hooks und optional (`--claude-md`) einen CLAUDE.md-Abschnitt ein. Das ist idempotent, fremde Hooks bleiben erhalten, und `uninstall` räumt rückstandslos ab. Es gibt zwei Modi:
+    - **Standard (lokal):** absolute Pfade, `claude mcp add --scope local` und `.claude/settings.local.json`.
+    - **`--shared`:** portabel und zum Committen gedacht, mit `.mcp.json` und `.claude/settings.json`. Dafür muss `wingman` im PATH sein, und der Workspace wird durch Aufwärtssuche vom Projekt gefunden.
 - **Skill / CLAUDE.md-Snippet**: kurze Anleitung „Nutze zuerst `search_code`/`find_relevant_for_task`, bevor du großflächig grep-st“.
 - **Python-API** für eigene Skripte und andere Agent-Frameworks.
 
@@ -473,7 +496,13 @@ agent-wingman/
 │   ├── extract/                # tree-sitter-Visitor je Sprache: typescript.py, csharp.py
 │   ├── indexer.py              # inkrementell: Hash-Vergleich, Speichern, FTS
 │   ├── resolver.py             # Imports, Typen, Aufrufe, Vererbung, overrides-Kanten
-│   ├── query.py                # search, symbol, callers, callees, outline
+│   ├── query.py                # search, symbol, callers, callees, tests, outline
+│   ├── context.py              # Bug-Report/Aufgabe → Signale → Ranking → Context Pack
+│   ├── render.py               # Textausgabe für CLI und MCP
+│   ├── notes.py                # Notizen an Symbolen/Dateien/Verzeichnissen
+│   ├── mcp_server.py           # MCP-Server (stdio)
+│   ├── hooks.py                # Claude-Code-Hooks (post-edit, session-start)
+│   ├── claude_setup.py         # wingman claude install/uninstall
 │   ├── (später) enrich/        # LLM-Summaries, Provider-Interface
 │   ├── (später) embed/         # Embedding-Provider
 │   ├── (später) docs/          # PDF/URL/MD-Ingest, Chunker, Linker
@@ -483,8 +512,7 @@ agent-wingman/
 │   │   ├── store.py            # Workspaces & Repositories
 │   │   └── search.py           # SearchBackend: SQLite FTS5, LIKE-Fallback (später tsvector/pgvector)
 │   ├── (später) resolve/scip   # SCIP/LSP-Adapter
-│   ├── (später) context.py     # Hybrid-Suche, RRF, Graph-Expansion, Context Pack
-│   └── (später) mcp_server.py
+│   └── workspace.py            # Config + DB für CLI, MCP und Hooks
 └── tests/
     └── fixtures/               # Mini-Repos je Sprache mit erwarteten Indizes
 ```
@@ -501,7 +529,7 @@ Der Prototyp ist auf **einen Entwickler mit lokaler SQLite-DB** ausgelegt. Das D
 |------|--------|----------|
 | **0 – Skeleton** ✅ | `pyproject`, CLI-Gerüst, Config, SQLite-Schema + Alembic, Workspace/Repo-Verwaltung | `wingman init`, `wingman repo add` laufen |
 | **1 – Strukturindex** ✅ | Scanner, tree-sitter für **TypeScript + C#**, Symbole, Imports, Refs, lokaler/Import-Resolver (inkl. `tsconfig`-Pfade, C#-Namespaces), FTS5 | `wingman index`, `search`, `symbol`, `callers`, `callees`, `outline` |
-| **2 – MCP** | MCP-Server mit Kern-Tools, Context Pack, inkrementelles Indexing, Hooks | In Claude Code nutzbar |
+| **2 – MCP** ✅ | MCP-Server mit Kern-Tools, Context Pack, inkrementelles Indexing, Hooks | In Claude Code nutzbar |
 | **3 – Multi-Repo** | Paket-Abhängigkeiten zwischen Repos, HTTP-Endpunkt-Matching (ASP.NET ↔ fetch/axios) | Agent folgt Aufrufen vom Frontend ins Backend |
 | **4 – Semantik** | Embeddings (lokal), sqlite-vec, Hybrid-Suche + RRF + Graph-Expansion | Bug-Report → relevante Stellen |
 | **5 – Summaries** | LLM-Enricher bottom-up (Anthropic, kleines Modell, Opt-in), Cache, Budget, Datei-/Modul-Summaries | Undokumentierter Code wird durchsuchbar |

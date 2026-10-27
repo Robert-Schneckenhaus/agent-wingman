@@ -10,6 +10,7 @@ from sqlalchemy import Connection, and_, case, func, or_, select
 
 from wingman.storage.schema import files, refs, repositories, symbol_edges, symbols
 from wingman.storage.search import backend_for, query_terms, searchable
+from wingman.storage.store import Note, list_notes
 
 CALL_KINDS = ("call", "instantiate")
 MEMBER_KINDS = frozenset({"property", "field", "const"})
@@ -56,9 +57,15 @@ class RefHit:
     via: str | None = None
     """Set when the edge goes through an interface/base method."""
     children: list[RefHit] = field(default_factory=list)
+    repo: str | None = None
+
+    @property
+    def repo_path(self) -> str:
+        return f"{self.repo}:{self.path}" if self.repo else str(self.path)
 
     def to_dict(self) -> dict:
         return {
+            "repo": self.repo,
             "symbol": self.symbol.to_dict() if self.symbol else None,
             "kind": self.kind,
             "line": self.line,
@@ -137,6 +144,62 @@ def find_symbols(
     return []
 
 
+@dataclass
+class NameLookup:
+    found: list[SymbolHit]
+    ambiguous: bool
+
+
+def resolve_name(
+    conn: Connection,
+    workspace_id: int,
+    name: str,
+    *,
+    repo: str | None = None,
+    kinds: set[str] | None = None,
+) -> NameLookup:
+    """Symbols for ``name`` (simple name, ``Class.member``, qualified name or ``#id``).
+
+    Overloads and partial-class parts share one qualified name and are returned
+    together; different qualified names make the lookup ambiguous.
+    """
+    if name.startswith("#") and name[1:].isdigit():
+        found = list(get_symbols(conn, [int(name[1:])]).values())
+    else:
+        found = find_symbols(conn, workspace_id, name, repo=repo, kinds=kinds)
+    qualified = {(h.repo, h.qualified_name) for h in found}
+    return NameLookup(found, len(qualified) > 1)
+
+
+def symbol_at(conn: Connection, file_id: int, line: int) -> SymbolHit | None:
+    """Innermost symbol whose range contains ``line``."""
+    row = conn.execute(
+        _hit_query()
+        .where(
+            symbols.c.file_id == file_id,
+            symbols.c.start_line <= line,
+            symbols.c.end_line >= line,
+        )
+        .order_by((symbols.c.end_line - symbols.c.start_line), symbols.c.start_byte.desc())
+        .limit(1)
+    ).first()
+    return _hit(row) if row is not None else None
+
+
+def tests_for(conn: Connection, symbol_id: int, *, depth: int = 3) -> list[SymbolHit]:
+    """Symbols in test files that reach ``symbol_id`` through at most ``depth`` calls."""
+    found: dict[int, SymbolHit] = {}
+
+    def walk(refs_: list[RefHit]) -> None:
+        for ref in refs_:
+            if ref.symbol is not None and ref.symbol.is_test:
+                found.setdefault(ref.symbol.id, ref.symbol)
+            walk(ref.children)
+
+    walk(callers(conn, symbol_id, depth=depth))
+    return sorted(found.values(), key=lambda h: (h.repo, h.path, h.start_line))
+
+
 def search(
     conn: Connection,
     workspace_id: int,
@@ -157,10 +220,14 @@ def search(
     words = {w.lower() for w in query.split()}
     terms = query_terms(query)
     hits = []
+    own_match: set[int] = set()  # symbols whose own name/signature/doc matches
     for row in rows:
         if row.is_test and not include_tests:
             continue
         score = scores[row.id]
+        own = searchable(f"{row.name} {row.signature or ''} {row.summary or ''}").lower()
+        if any(t in own for t in terms):
+            own_match.add(row.id)
         # prefer symbols that cover more of the query terms
         haystack = searchable(
             f"{row.qualified_name} {row.signature or ''} {row.summary or ''} {row.path}"
@@ -178,8 +245,38 @@ def search(
         if row.kind == "constructor":  # same name as its class, which should win
             score *= 0.5
         hits.append(_hit(row, round(score, 3)))
+    return _diversify(hits, limit, own_match)
+
+
+MAX_MEMBERS_PER_PARENT = 2
+
+
+def _diversify(hits: list[SymbolHit], limit: int, own_match: set[int]) -> list[SymbolHit]:
+    """Members often match only through their class name in the qualified name: rank
+    those below the matching parent and keep at most a few per parent. Symbols with the
+    same simple name (copies in several services) are damped after the first two."""
+    present = {h.id for h in hits}
+    for hit in hits:
+        if hit.parent_id in present and hit.id not in own_match:
+            hit.score = round(hit.score * 0.5, 3)
     hits.sort(key=lambda h: -h.score)
-    return hits[:limit]
+    same_name: dict[str, int] = {}
+    for hit in hits:
+        same_name[hit.name] = same_name.get(hit.name, 0) + 1
+        if same_name[hit.name] > 2:
+            hit.score = round(hit.score * 0.5, 3)
+    hits.sort(key=lambda h: -h.score)
+    per_parent: dict[int, int] = {}
+    result = []
+    for hit in hits:
+        if hit.parent_id is not None:
+            per_parent[hit.parent_id] = per_parent.get(hit.parent_id, 0) + 1
+            if per_parent[hit.parent_id] > MAX_MEMBERS_PER_PARENT:
+                continue
+        result.append(hit)
+        if len(result) == limit:
+            break
+    return result
 
 
 def _overridden(conn: Connection, symbol_id: int) -> list[int]:
@@ -231,8 +328,10 @@ def callers(
             refs.c.confidence,
             refs.c.target_name,
             files.c.path,
+            repositories.c.name.label("repo"),
         )
         .join(files, files.c.id == refs.c.from_file_id)
+        .join(repositories, repositories.c.id == files.c.repo_id)
         .where(refs.c.to_symbol_id.in_(list(targets)), refs.c.kind.in_(kinds))
         .order_by(files.c.path, refs.c.line)
     ).all()
@@ -248,6 +347,7 @@ def callers(
             target_name=row.target_name,
             path=row.path,
             via=via,
+            repo=row.repo,
         )
         if depth > 1 and row.from_symbol_id and row.from_symbol_id not in seen:
             seen.add(row.from_symbol_id)
@@ -474,3 +574,19 @@ def workspace_stats(conn: Connection, workspace_id: int) -> WorkspaceStats:
         ).where(and_(refs.c.from_file_id.in_(file_ids)))
     ).one()
     return WorkspaceStats(repo_count, file_count, symbol_count, ref_row[0], ref_row[1] or 0)
+
+
+def stable_keys(conn: Connection, ids: list[int]) -> dict[int, str]:
+    if not ids:
+        return {}
+    rows = conn.execute(select(symbols.c.id, symbols.c.stable_key).where(symbols.c.id.in_(ids)))
+    return {row.id: row.stable_key for row in rows}
+
+
+def notes_for_symbols(conn: Connection, workspace_id: int, ids: list[int]) -> dict[int, list[Note]]:
+    """Notes attached to the given symbols (matched via ``stable_key``)."""
+    keys = stable_keys(conn, ids)
+    by_key: dict[str, list[Note]] = {}
+    for note in list_notes(conn, workspace_id, list(keys.values())):
+        by_key.setdefault(note.target_key, []).append(note)
+    return {sid: by_key[key] for sid, key in keys.items() if key in by_key}

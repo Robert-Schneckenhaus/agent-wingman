@@ -1,34 +1,4 @@
 import json
-import shutil
-from pathlib import Path
-
-import pytest
-
-from wingman.cli import main
-
-FIXTURES = Path(__file__).parent / "fixtures"
-
-
-@pytest.fixture
-def ws(tmp_path, runner, monkeypatch):
-    """CLI workspace with both fixture repositories added and indexed."""
-    for name in ("ts_app", "cs_app"):
-        shutil.copytree(FIXTURES / name, tmp_path / name)
-    monkeypatch.chdir(tmp_path)
-
-    def run(*args, ok=True):
-        result = runner.invoke(main, list(args))
-        if ok:
-            assert result.exit_code == 0, result.output
-        return result
-
-    run("init", "--workspace", "demo")
-    run("repo", "add", "ts_app")
-    run("repo", "add", "cs_app")
-    result = run("index")
-    assert "ts_app: 7 indexed" in result.output
-    assert "cs_app: 6 indexed" in result.output
-    return run
 
 
 def test_index_is_incremental(ws):

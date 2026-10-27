@@ -22,9 +22,16 @@ uv venv && uv pip install -e ".[dev]"   # or: python -m venv .venv && pip instal
 - `src/wingman/extract/` – tree-sitter visitors per language (`typescript.py`, `csharp.py`)
 - `src/wingman/indexer.py` – incremental indexing (hash compare, store, FTS)
 - `src/wingman/resolver.py` – resolves imports, refs, inheritance; builds `symbol_edges`
-- `src/wingman/query.py` – read side used by the CLI (later the MCP server)
+- `src/wingman/query.py` – read side used by CLI and MCP server
+- `src/wingman/context.py` – bug report/task text -> signals -> ranked context pack
+- `src/wingman/render.py` – text output shared by CLI and MCP server
+- `src/wingman/notes.py` – notes on symbols/files/directories (keyed by stable keys)
+- `src/wingman/workspace.py` – config + engine access shared by CLI, MCP server, hooks
+- `src/wingman/mcp_server.py` – MCP server (stdio, `wingman mcp`)
+- `src/wingman/hooks.py`, `claude_setup.py` – Claude Code hooks and `wingman claude install`
 - `tests/` – pytest; `tests/test_migrations.py` fails if schema and migrations diverge;
-  `tests/fixtures/{ts_app,cs_app}` are small repos with known expected resolutions
+  `tests/fixtures/{ts_app,cs_app}` are small repos with known expected resolutions;
+  the `indexed` (API) and `ws` (CLI) fixtures in `tests/conftest.py` index both
 
 ## Schema changes
 
@@ -37,8 +44,9 @@ uv venv && uv pip install -e ".[dev]"   # or: python -m venv .venv && pip instal
    ```
 3. Review the generated file (replace SQLite-specific defaults such as
    `sa.text('(CURRENT_TIMESTAMP)')` with `sa.func.now()`), then run the tests.
-   If the change affects what the extractor stores, add
-   `op.execute("UPDATE files SET content_hash = ''")` so the next index re-parses.
+   If only the extractor output changes (no schema change), bump
+   `EXTRACTOR_VERSION` in `src/wingman/extract/__init__.py` instead: it is part of
+   each file's content hash, so the next `wingman index` re-parses everything.
 4. SQLite does not detect column comment changes; check PostgreSQL if possible.
 
 ## Conventions

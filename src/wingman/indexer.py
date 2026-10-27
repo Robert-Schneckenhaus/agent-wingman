@@ -9,14 +9,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from sqlalchemy import Connection, Engine, delete, insert, select, update
+from sqlalchemy import Connection, Engine, case, delete, func, insert, select, update
 
 from wingman import git
-from wingman.extract import extract
+from wingman.extract import EXTRACTOR_VERSION, extract
 from wingman.extract.base import short_hash
 from wingman.extract.model import Extraction
 from wingman.resolver import resolve_repository
-from wingman.scanner import SourceFile, is_generated, is_test_path, scan
+from wingman.scanner import SourceFile, is_generated, is_test_path, scan, scan_paths
 from wingman.storage.schema import files, imports, index_runs, refs, repositories, symbols
 from wingman.storage.search import FtsRow, SearchBackend, backend_for
 from wingman.storage.store import RepoInfo
@@ -57,17 +57,20 @@ def index_repository(
     repo: RepoInfo,
     *,
     full: bool = False,
+    paths: list[str] | None = None,
     progress: ProgressCallback | None = None,
 ) -> IndexStats:
+    """Index ``repo``; with ``paths`` (repository-relative) only those files are
+    checked: re-parsed if changed, removed from the index if gone or ignored."""
     root = Path(repo.root_path)
     if not root.is_dir():
         raise IndexingError(f"Repository path does not exist: {root}")
 
     started = time.monotonic()
     stats = IndexStats()
-    sources = scan(root)
+    sources = scan(root) if paths is None else scan_paths(root, paths)
     stats.files_scanned = len(sources)
-    commit = git.head_commit(root)
+    commit = git.head_commit(root) if paths is None else repo.last_commit
 
     with engine.begin() as conn:
         backend = backend_for(conn)
@@ -75,14 +78,13 @@ def index_repository(
             insert(index_runs).values(repo_id=repo.id, status="running", commit_sha=commit)
         ).inserted_primary_key[0]
 
-        existing = {
-            row.path: (row.id, row.content_hash)
-            for row in conn.execute(
-                select(files.c.id, files.c.path, files.c.content_hash).where(
-                    files.c.repo_id == repo.id
-                )
-            )
-        }
+        existing_query = select(files.c.id, files.c.path, files.c.content_hash).where(
+            files.c.repo_id == repo.id
+        )
+        if paths is not None:
+            requested = [Path(p).as_posix().removeprefix("./") for p in paths]
+            existing_query = existing_query.where(files.c.path.in_(requested))
+        existing = {row.path: (row.id, row.content_hash) for row in conn.execute(existing_query)}
 
         for number, source in enumerate(sources, 1):
             try:
@@ -90,7 +92,7 @@ def index_repository(
             except OSError as exc:
                 stats.errors.append(f"{source.path}: {exc}")
                 continue
-            content_hash = hashlib.sha256(data).hexdigest()
+            content_hash = hashlib.sha256(EXTRACTOR_VERSION.encode() + b"\0" + data).hexdigest()
             previous = existing.get(source.path)
             if previous is not None and previous[1] == content_hash and not full:
                 stats.files_unchanged += 1
@@ -114,12 +116,17 @@ def index_repository(
         _delete_files(conn, backend, removed)
         stats.files_removed = len(removed)
 
-        if progress and len(sources) > 200:
-            progress(f"{repo.name}: resolving references")
-        resolved = resolve_repository(conn, repo.id, root)
-        stats.refs_resolved = resolved.resolved
-        stats.refs = resolved.refs
-        stats.edges = resolved.edges
+        if stats.files_indexed or stats.files_removed:
+            if progress and len(sources) > 200:
+                progress(f"{repo.name}: resolving references")
+            resolved = resolve_repository(conn, repo.id, root)
+            stats.refs_resolved, stats.refs, stats.edges = (
+                resolved.resolved,
+                resolved.refs,
+                resolved.edges,
+            )
+        else:  # nothing changed: keep the previous resolution
+            stats.refs, stats.refs_resolved = _ref_counts(conn, repo.id)
         stats.seconds = round(time.monotonic() - started, 2)
 
         now = datetime.now(UTC)
@@ -139,6 +146,19 @@ def index_repository(
             .values(last_commit=commit, updated_at=now)
         )
     return stats
+
+
+def _ref_counts(conn: Connection, repo_id: int) -> tuple[int, int]:
+    row = conn.execute(
+        select(
+            func.count(),
+            func.coalesce(func.sum(case((refs.c.to_symbol_id.is_not(None), 1), else_=0)), 0),
+        )
+        .select_from(refs)
+        .join(files, files.c.id == refs.c.from_file_id)
+        .where(files.c.repo_id == repo_id)
+    ).one()
+    return row[0], row[1]
 
 
 def _delete_files(conn: Connection, backend: SearchBackend, file_ids: list[int]) -> None:

@@ -4,19 +4,19 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
 
 import click
 from sqlalchemy import Engine
 from sqlalchemy.exc import DBAPIError, NoSuchModuleError
 
-from wingman import __version__, git, query
+from wingman import __version__, claude_setup, context, git, hooks, notes, query, render
 from wingman.config import (
     CONFIG_FILE,
     DEFAULT_DB_FILE,
     ENV_HOME,
     WINGMAN_DIR,
-    Config,
     ConfigError,
     load_config,
     render_config,
@@ -24,46 +24,13 @@ from wingman.config import (
 from wingman.indexer import IndexingError, index_repository
 from wingman.storage import db, store
 from wingman.storage.search import backend_for
+from wingman.workspace import Workspace, WorkspaceError
 
 REPO_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
-class AppContext:
-    """Lazily loads configuration and database for subcommands."""
-
-    def __init__(self, home: Path | None) -> None:
-        self._home = home
-        self._config: Config | None = None
-        self._engine: Engine | None = None
-
-    @property
-    def config(self) -> Config:
-        if self._config is None:
-            try:
-                self._config = load_config(self._home)
-            except ConfigError as exc:
-                raise click.ClickException(str(exc)) from exc
-        return self._config
-
-    @property
-    def engine(self) -> Engine:
-        if self._engine is None:
-            engine = db.create_db_engine(self.config.db_url)
-            if not db.is_up_to_date(engine):
-                if db.is_sqlite(self.config.db_url):
-                    db.upgrade(engine)
-                else:
-                    raise click.ClickException(
-                        "Database schema is out of date. Run 'wingman db upgrade'."
-                    )
-            self._engine = engine
-        return self._engine
-
-    def workspace_id(self, conn) -> int:
-        try:
-            return store.get_workspace_id(conn, self.config.workspace)
-        except store.StoreError as exc:
-            raise click.ClickException(str(exc)) from exc
+class AppContext(Workspace):
+    """Workspace for CLI subcommands (errors become click errors via WingmanGroup)."""
 
 
 pass_app = click.make_pass_decorator(AppContext)
@@ -75,6 +42,8 @@ class WingmanGroup(click.Group):
     def invoke(self, ctx: click.Context):
         try:
             return super().invoke(ctx)
+        except WorkspaceError as exc:
+            raise click.ClickException(str(exc)) from exc
         except DBAPIError as exc:
             raise click.ClickException(f"Database error: {exc.orig}") from exc
         except NoSuchModuleError as exc:
@@ -287,33 +256,17 @@ def _echo_json(data) -> None:
     click.echo(json.dumps(data, indent=2, ensure_ascii=False, default=str))
 
 
-def _hit_lines(hit: query.SymbolHit, indent: str = "") -> list[str]:
-    lines = [f"{indent}{hit.location}  {hit.kind} {hit.qualified_name}"]
-    if hit.signature and hit.kind not in ("namespace",):
-        lines.append(f"{indent}    {hit.signature}")
-    if hit.summary:
-        lines.append(f"{indent}    — {hit.summary}")
-    return lines
-
-
 def _resolve_symbols(
     conn, app: AppContext, name: str, repo: str | None, kinds: tuple[str, ...]
 ) -> list[query.SymbolHit]:
-    """Symbols for NAME; all overloads/partial parts if they share one qualified name."""
-    if name.startswith("#") and name[1:].isdigit():
-        found = list(query.get_symbols(conn, [int(name[1:])]).values())
-    else:
-        found = query.find_symbols(
-            conn, app.workspace_id(conn), name, repo=repo, kinds=set(kinds) or None
-        )
-    if not found:
+    lookup = query.resolve_name(
+        conn, app.workspace_id(conn), name, repo=repo, kinds=set(kinds) or None
+    )
+    if not lookup.found:
         raise click.ClickException(f"No symbol '{name}'. Try: wingman search {name}")
-    qualified = {(h.repo, h.qualified_name) for h in found}
-    if len(qualified) > 1:
-        lines = [f"'{name}' is ambiguous; use a qualified name or #id:"]
-        lines += [f"  #{h.id:<6} {h.kind:<10} {h.qualified_name}  [{h.location}]" for h in found]
-        raise click.ClickException("\n".join(lines))
-    return found
+    if lookup.ambiguous:
+        raise click.ClickException(render.ambiguous(name, lookup.found))
+    return lookup.found
 
 
 @main.command("search")
@@ -338,11 +291,34 @@ def search_cmd(app, text, limit, no_tests, repo, kinds, as_json) -> None:
         )
     if as_json:
         _echo_json([h.to_dict() for h in hits])
-        return
-    if not hits:
-        click.echo("No matches.")
-    for hit in hits:
-        click.echo("\n".join(_hit_lines(hit)))
+    else:
+        click.echo(render.hits(hits))
+
+
+@main.command("context")
+@click.argument("task", nargs=-1)
+@click.option(
+    "--file", "task_file", type=click.File("r"), help="Read the task from a file ('-' = stdin)."
+)
+@click.option("--limit", "-n", default=8, show_default=True, help="Number of symbols.")
+@click.option("--budget", default=4000, show_default=True, help="Approximate token budget.")
+@click.option("--code", is_flag=True, help="Include source code of the top symbols.")
+@json_option
+@pass_app
+def context_cmd(app, task, task_file, limit, budget, code, as_json) -> None:
+    """Relevant code for a bug report or task (identifiers, stack traces, full text)."""
+    text = task_file.read() if task_file else " ".join(task)
+    if not text.strip():
+        raise click.UsageError("Give the task as arguments or with --file.")
+    with app.engine.connect() as conn:
+        pack = context.find_relevant(
+            conn, app.workspace_id(conn), text, limit=limit, include_code=code
+        )
+        output = pack.to_dict() if as_json else context.render_pack(pack, budget=budget)
+    if as_json:
+        _echo_json(output)
+    else:
+        click.echo(output)
 
 
 @main.command("symbol")
@@ -358,53 +334,18 @@ def symbol_cmd(app, name, code, repo, kinds, as_json) -> None:
         found = _resolve_symbols(conn, app, name, repo, kinds)
         details = [query.symbol_details(conn, h.id) for h in found]
         sources = {h.id: query.read_source(conn, h.id) for h in found} if code else {}
+        notes = query.notes_for_symbols(conn, app.workspace_id(conn), [h.id for h in found])
     if as_json:
-        data = [d.to_dict() | ({"code": sources.get(d.symbol.id)} if code else {}) for d in details]
-        _echo_json(data)
-        return
-    for number, d in enumerate(details):
-        if number:
-            click.echo("")
-        s = d.symbol
-        click.echo(f"{s.kind} {s.qualified_name}  [{s.location}]  #{s.id}")
-        if s.signature:
-            click.echo(f"  {s.signature}")
-        attributes = list(d.modifiers)
-        if d.visibility and d.visibility.split()[0] not in attributes:
-            attributes.insert(0, d.visibility)
-        if attributes:
-            click.echo(f"  modifiers: {' '.join(attributes)}")
-        for decorator in d.decorators:
-            click.echo(f"  {decorator}")
-        if d.doc:
-            click.echo("  doc: " + d.doc.replace("\n", "\n       "))
-        for label, items in (
-            ("bases", d.bases),
-            ("derived", d.derived),
-            ("overrides", d.overrides),
-            ("overridden by", d.overridden_by),
-        ):
-            for item in items:
-                click.echo(f"  {label}: {item.qualified_name}  [{item.location}]")
-        if d.members:
-            click.echo(f"  members ({len(d.members)}):")
-            for m in d.members:
-                click.echo(f"    {m.start_line:>5}  {m.kind:<11} {m.name}")
-        click.echo(f"  callers: {d.caller_count}")
-        if code and sources.get(s.id):
-            click.echo("")
-            click.echo(sources[s.id])
-
-
-def _print_ref_tree(hits: list[query.RefHit], indent: str = "  ") -> None:
-    for hit in hits:
-        if hit.symbol is not None:
-            who = f"{hit.symbol.kind} {hit.symbol.qualified_name}"
-        else:
-            who = "<top-level code>"
-        via = f", via {hit.via}" if hit.via else ""
-        click.echo(f"{indent}{hit.path}:{hit.line}  {who}  ({hit.kind}, {hit.confidence:.2f}{via})")
-        _print_ref_tree(hit.children, indent + "  ")
+        _echo_json(
+            [
+                d.to_dict()
+                | {"notes": [n.text for n in notes.get(d.symbol.id, [])]}
+                | ({"code": sources.get(d.symbol.id)} if code else {})
+                for d in details
+            ]
+        )
+    else:
+        click.echo(render.details(details, sources, notes))
 
 
 @main.command("callers")
@@ -430,12 +371,8 @@ def callers_cmd(app, name, depth, include_types, repo, kinds, as_json) -> None:
                 for h in found
             ]
         )
-        return
-    for hit in found:
-        click.echo(f"Callers of {hit.kind} {hit.qualified_name}  [{hit.location}]")
-        if not results[hit.id]:
-            click.echo("  (none found)")
-        _print_ref_tree(results[hit.id])
+    else:
+        click.echo("\n".join(render.callers(h, results[h.id]) for h in found))
 
 
 @main.command("callees")
@@ -457,18 +394,30 @@ def callees_cmd(app, name, include_types, repo, kinds, as_json) -> None:
                 for h in found
             ]
         )
+    else:
+        click.echo("\n".join(render.callees(h, results[h.id]) for h in found))
+
+
+@main.command("tests")
+@click.argument("name")
+@click.option("--depth", "-d", default=3, show_default=True, help="Max. call depth.")
+@repo_option
+@kind_option
+@json_option
+@pass_app
+def tests_cmd(app, name, depth, repo, kinds, as_json) -> None:
+    """Tests that (directly or indirectly) call a symbol."""
+    with app.engine.connect() as conn:
+        found = _resolve_symbols(conn, app, name, repo, kinds)
+        tests = {h.id: query.tests_for(conn, h.id, depth=depth) for h in found}
+    if as_json:
+        _echo_json(
+            [{"symbol": h.to_dict(), "tests": [t.to_dict() for t in tests[h.id]]} for h in found]
+        )
         return
     for hit in found:
-        click.echo(f"Callees of {hit.kind} {hit.qualified_name}  [{hit.location}]")
-        for ref in results[hit.id]:
-            if ref.symbol is not None:
-                target = f"{ref.symbol.qualified_name}  [{ref.symbol.location}]"
-                click.echo(
-                    f"  L{ref.line:<5} {ref.kind:<11} {ref.target_name} -> {target} "
-                    f"({ref.confidence:.2f})"
-                )
-            else:
-                click.echo(f"  L{ref.line:<5} {ref.kind:<11} {ref.target_name}  (unresolved)")
+        click.echo(f"Tests reaching {hit.kind} {hit.qualified_name}  [{hit.location}]")
+        click.echo(render.hits(tests[hit.id]) if tests[hit.id] else "  (none found)")
 
 
 @main.command("outline")
@@ -495,12 +444,186 @@ def outline_cmd(app, path, as_json) -> None:
                 "symbols": [e.symbol.to_dict() | {"depth": e.depth} for e in entries],
             }
         )
+    else:
+        click.echo(render.outline(repo_name, rel, entries))
+
+
+# --- notes ---------------------------------------------------------------------
+
+
+@main.group()
+def note() -> None:
+    """Knowledge attached to symbols or files (survives re-indexing)."""
+
+
+@note.command("add")
+@click.argument("target")
+@click.argument("text", nargs=-1, required=True)
+@click.option("--author", "-a", help="Who wrote the note.")
+@pass_app
+def note_add(app, target, text, author) -> None:
+    """Attach a note to TARGET (a symbol name, #id, or repo:path)."""
+    with app.engine.begin() as conn:
+        try:
+            note_id, label = notes.add(conn, app.workspace_id(conn), target, " ".join(text), author)
+        except notes.TargetError as exc:
+            raise click.ClickException(str(exc)) from exc
+    click.echo(f"Note #{note_id} added to {label}.")
+
+
+@note.command("list")
+@click.argument("target", required=False)
+@json_option
+@pass_app
+def note_list(app, target, as_json) -> None:
+    """List notes (optionally only those of TARGET)."""
+    with app.engine.connect() as conn:
+        try:
+            items = notes.list_for(conn, app.workspace_id(conn), target)
+        except notes.TargetError as exc:
+            raise click.ClickException(str(exc)) from exc
+    if as_json:
+        _echo_json([n.__dict__ for n in items])
         return
-    click.echo(f"{repo_name}:{rel}")
-    for entry in entries:
-        s = entry.symbol
-        lines = f"{s.start_line}-{s.end_line}"
-        click.echo(f"  {lines:>9}  {'  ' * entry.depth}{s.kind} {s.name}")
+    if not items:
+        click.echo("No notes.")
+    for item in items:
+        author = f" ({item.author})" if item.author else ""
+        click.echo(f"#{item.id:<4} {item.target_key or '-'}{author}\n      {item.text}")
+
+
+@note.command("remove")
+@click.argument("note_id", type=int)
+@pass_app
+def note_remove(app, note_id) -> None:
+    """Delete note NOTE_ID."""
+    with app.engine.begin() as conn:
+        try:
+            store.delete_note(conn, app.workspace_id(conn), note_id)
+        except store.StoreError as exc:
+            raise click.ClickException(str(exc)) from exc
+    click.echo(f"Note #{note_id} removed.")
+
+
+# --- agent integration -----------------------------------------------------------
+
+
+@main.command("mcp")
+@pass_app
+def mcp_cmd(app: AppContext) -> None:
+    """Run the MCP server on stdio (used by Claude Code)."""
+    from wingman.mcp_server import create_server
+
+    with app.engine.connect() as conn:  # fail early with a readable message
+        app.workspace_id(conn)
+    create_server(workspace=app).run("stdio")
+
+
+@main.command("reindex")
+@click.argument("paths", nargs=-1, required=True, type=click.Path(path_type=Path, dir_okay=False))
+@pass_app
+def reindex_cmd(app: AppContext, paths: tuple[Path, ...]) -> None:
+    """Re-index single files (absolute or relative to the current directory)."""
+    by_repo: dict[str, tuple[store.RepoInfo, list[str]]] = {}
+    for path in paths:
+        located = app.locate(path)
+        if located is None:
+            click.echo(f"{path}: not inside an indexed repository", err=True)
+            continue
+        repo_info, rel = located
+        by_repo.setdefault(repo_info.name, (repo_info, []))[1].append(rel)
+    for repo_info, rels in by_repo.values():
+        stats = index_repository(app.engine, repo_info, paths=rels)
+        click.echo(
+            f"{repo_info.name}: {stats.files_indexed} indexed, {stats.files_removed} removed, "
+            f"{stats.files_unchanged} unchanged; {stats.seconds}s"
+        )
+
+
+@main.group()
+def hook() -> None:
+    """Claude Code hook handlers (read the hook payload from stdin; never fail)."""
+
+
+@hook.command("post-edit")
+@pass_app
+def hook_post_edit(app: AppContext) -> None:
+    """PostToolUse: re-index the file an Edit/Write tool just changed."""
+    try:
+        message = hooks.post_edit(app, hooks.read_payload(sys.stdin.read()))
+    except Exception as exc:  # never break the agent's session
+        click.echo(f"wingman hook post-edit: {exc}", err=True)
+        return
+    if message:
+        click.echo(message, err=True)
+
+
+@hook.command("session-start")
+@pass_app
+def hook_session_start(app: AppContext) -> None:
+    """SessionStart: update the index and tell the agent about the MCP tools."""
+    try:
+        click.echo(hooks.session_start(app))
+    except Exception as exc:
+        click.echo(f"wingman hook session-start: {exc}", err=True)
+
+
+@main.group("claude")
+def claude_group() -> None:
+    """Set up Claude Code for a project (MCP server, hooks, CLAUDE.md)."""
+
+
+project_argument = click.argument(
+    "project", required=False, default=".", type=click.Path(file_okay=False, path_type=Path)
+)
+shared_option = click.option(
+    "--shared",
+    is_flag=True,
+    help="Write portable config to commit (.mcp.json, .claude/settings.json) instead of "
+    "machine-local config.",
+)
+
+
+@claude_group.command("install")
+@project_argument
+@shared_option
+@click.option("--claude-md", is_flag=True, help="Add usage instructions to CLAUDE.md.")
+@click.option("--no-mcp", is_flag=True, help="Only install hooks.")
+@pass_app
+def claude_install(app: AppContext, project: Path, shared, claude_md, no_mcp) -> None:
+    """Register the MCP server and hooks for PROJECT (default: current directory)."""
+    project = project.resolve()
+    home = app.config.home
+    if shared and not project.is_relative_to(app.config.root):
+        click.echo(
+            f"Warning: {project} is not inside the workspace {app.config.root}; shared "
+            "config finds the workspace by walking up from the project directory.",
+            err=True,
+        )
+    try:
+        result = claude_setup.install(
+            project, home, shared=shared, claude_md=claude_md, register_mcp=not no_mcp
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    for changed in result.changed:
+        click.echo(f"updated: {changed}")
+    for instruction in result.instructions:
+        click.echo(instruction)
+    click.echo("Restart Claude Code in the project to load the MCP server and hooks.")
+
+
+@claude_group.command("uninstall")
+@project_argument
+@shared_option
+def claude_uninstall(project: Path, shared) -> None:
+    """Remove the MCP server, hooks and CLAUDE.md section from PROJECT."""
+    try:
+        result = claude_setup.uninstall(project.resolve(), shared=shared)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    for changed in result.changed:
+        click.echo(f"updated: {changed}")
 
 
 # --- db ------------------------------------------------------------------------

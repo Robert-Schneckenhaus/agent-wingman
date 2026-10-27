@@ -165,15 +165,22 @@ def test_type_refs_are_deduplicated_and_skip_type_parameters():
     assert type_refs == ["Foo", "Promise", "Bar"]
 
 
-def test_locals_in_callbacks_are_not_symbols():
+def test_test_blocks_become_symbols_and_locals_stay_local():
     result = _extract(
         """
-describe("x", () => {
+describe("TaxCalculator", () => {
   const calc = new Calc();
-  calc.run();
+  it.only("applies VAT", () => {
+    calc.run();
+  });
+  helper();
 });
 """
     )
-    assert result.symbols == []
+    assert [(s.kind, s.qualified_name) for s in result.symbols] == [
+        ("test_suite", "TaxCalculator"),
+        ("test", "TaxCalculator.applies VAT"),
+    ]
     run = next(r for r in result.refs if r.target_name == "run")
     assert run.qualifier_type == "Calc"
+    assert result.symbols[run.from_symbol].kind == "test"

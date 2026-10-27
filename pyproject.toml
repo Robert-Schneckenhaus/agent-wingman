@@ -12,6 +12,7 @@ license = { text = "MIT" }
 dependencies = [
     "alembic>=1.13",
     "click>=8.1",
+    "mcp>=2.0",
     "pathspec>=0.12",
     "sqlalchemy>=2.0",
     "tree-sitter>=0.23",
@@ -40,3 +41,6 @@ extend-exclude = ["src/wingman/storage/migrations/versions"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/test_context.py" = ["E501"]  # verbatim stack traces

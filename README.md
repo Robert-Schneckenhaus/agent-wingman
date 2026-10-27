@@ -7,9 +7,10 @@ another SQL database.
 
 The full design is in [CONCEPT.md](CONCEPT.md) (German).
 
-> **Status:** Phase 1 – structural index for **TypeScript/TSX and C#**: symbols,
-> docs, imports, call graph, inheritance and full-text search. MCP server, embeddings
-> and LLM summaries follow in later phases (see the roadmap in CONCEPT.md).
+> **Status:** Phase 2 – structural index for **TypeScript/TSX and C#** (symbols, docs,
+> imports, call graph, inheritance, full-text search), context packs for bug reports,
+> an MCP server and hooks for Claude Code. Multi-repo linking, embeddings, LLM
+> summaries and external docs follow (see the roadmap in CONCEPT.md).
 
 ## Installation
 
@@ -33,9 +34,32 @@ wingman status
 wingman repo remove web
 ```
 
+### Using it from Claude Code
+
+```bash
+cd ~/work/backend
+wingman claude install --claude-md      # MCP server + hooks for this project
+```
+
+This registers the MCP server `wingman` (local scope), adds two hooks to
+`.claude/settings.local.json` and a short usage section to `CLAUDE.md`:
+
+- **SessionStart** brings the index up to date and tells the agent to use the tools.
+- **PostToolUse** (Edit/Write) re-indexes the edited file immediately.
+
+MCP tools: `find_relevant_for_task` (paste a bug report, stack trace or task),
+`search_code`, `get_symbol`, `get_callers`, `get_callees`, `find_tests_for`,
+`get_file_outline`, `add_note`, `reindex`.
+
+Use `--shared` to write portable, committable config instead (`.mcp.json` and
+`.claude/settings.json`; requires `wingman` on `PATH` and the workspace in a parent
+directory of the project). `wingman claude uninstall` removes everything again.
+
 ### Finding code
 
 ```bash
+wingman context --file bug-report.txt     # ranked symbols for a bug report / stack trace
+wingman context "VAT line missing in PDF export" --code --budget 3000
 wingman search pdf tax lines              # full-text over names, signatures, docs, paths
 wingman search invoice --kind class --repo backend --no-tests
 wingman symbol TaxCalculator.Breakdown    # definition, doc, bases, overrides, members
@@ -43,6 +67,10 @@ wingman symbol '#42' --code               # by id, with source
 wingman callers SaveEntitiesAsync --depth 2   # incl. calls through interfaces/base methods
 wingman callees InvoicesController.GetTax
 wingman outline src/export/pdfRenderer.ts # also repo:path or a unique path suffix
+wingman tests TaxCalculator.Breakdown     # tests that reach a symbol (up to 3 calls deep)
+wingman note add TaxCalculator.Breakdown "Discount is applied before tax (#123)"
+wingman note add backend:src/Api "Controllers must call Audit()"
+wingman reindex src/billing/tax.ts        # single files, e.g. after a git checkout
 ```
 
 Every query command accepts `--json` for machine-readable output. Symbol names can
