@@ -72,7 +72,16 @@ Begründung: `tree-sitter` hat gute Python-Bindings (`tree-sitter-language-pack`
 
 - Einheitlicher Zugang über **tree-sitter** für alle Sprachen: robust bei Syntaxfehlern, schnell, inkrementell.
 - Pro Sprache eine **Query-Datei** (`queries/<lang>/symbols.scm`, `refs.scm`), ähnlich den `tags.scm` von GitHub/nvim. Neue Sprachen kommen dadurch meist ohne neuen Python-Code dazu.
-- Startsprachen: Python, TypeScript/JavaScript, C#, Java, Go. Danach C/C++, Rust, PHP, Kotlin.
+- **Sprachpriorität:**
+  1. **TypeScript** (inkl. TSX) und **C#**: Prototyp
+  2. **JavaScript** (inkl. JSX): fällt fast gratis mit TS ab, gleiche Grammatik-Familie
+  3. **Java**, **Python**, **PHP**
+  4. später nach Bedarf: Go, Kotlin, C/C++, Rust
+- Sprachspezifische Besonderheiten, die der Extractor kennen muss:
+  - **C#**: `namespace`/file-scoped namespaces, `partial class` (ein Symbol über mehrere Dateien), Properties mit Getter/Setter, Extension Methods, Attribute (`[HttpGet("x")]`, `[Fact]`/`[Test]` für Testerkennung), XML-Doc-Kommentare (`/// <summary>`), Interfaces und DI-Registrierungen (`services.AddScoped<IFoo, Foo>()` → Kante *implements/bound_to*).
+  - **TypeScript**: `export`/`export default`/Re-Exports (`export * from`), Barrel-Dateien (`index.ts`), Pfad-Aliase aus `tsconfig.json` (`paths`, `baseUrl`), Arrow Functions als `const foo = () => …`, Klassen-Felder, Decorators (Angular/NestJS), JSDoc/TSDoc, React-Komponenten (Funktion, die JSX zurückgibt → `kind = component`).
+  - **PHP**: Namespaces + `use`, Composer-Autoload (PSR-4) für Import-Auflösung, PHPDoc.
+- **Präzise Auflösung (optional, Phase 6):** für C# ein kleiner Roslyn-basierter Helfer (`dotnet tool`) bzw. `scip-dotnet`, für TS/JS `scip-typescript` bzw. die TypeScript Compiler API. Tree-sitter bleibt die Basis, die immer funktioniert, auch ohne Build.
 
 ### 3.3 Extractor – was pro Datei herausgezogen wird
 
@@ -139,6 +148,7 @@ Ziel: eine **relationale Kernstruktur**, die in SQLite und PostgreSQL gleich aus
 ### 4.1 Übersicht
 
 ```
+workspaces   1─n repositories
 repositories 1─n index_runs
 repositories 1─n files 1─n symbols ─┐ (parent_id: Verschachtelung)
                       │             │
@@ -152,9 +162,15 @@ summaries / embeddings  (polymorph an symbol | file | doc_chunk)
 ### 4.2 Tabellen (SQL, vereinfacht)
 
 ```sql
--- Ein indexiertes Repository (mehrere pro DB möglich, z. B. Monorepo + Libs)
+-- Workspace = Gruppe zusammengehöriger Repos (z. B. Frontend + Backend + Shared Libs)
+CREATE TABLE workspaces (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at TIMESTAMP
+);
+
+-- Ein indexiertes Repository (mehrere pro DB)
 CREATE TABLE repositories (
   id              INTEGER PRIMARY KEY,
+  workspace_id    INTEGER REFERENCES workspaces(id),
   name            TEXT NOT NULL,
   root_path       TEXT NOT NULL,
   remote_url      TEXT,
@@ -211,7 +227,7 @@ CREATE TABLE refs (
   from_file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
   to_symbol_id    INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
   unresolved_name TEXT,              -- falls nicht auflösbar (z. B. externe Lib)
-  kind            TEXT NOT NULL,     -- call|instantiate|type_ref|read|write|import
+  kind            TEXT NOT NULL,     -- call|instantiate|type_ref|read|write|import|http_call
   line INTEGER, col INTEGER,
   confidence      REAL NOT NULL DEFAULT 1.0,
   resolver        TEXT               -- local|import|heuristic|name|scip|lsp
@@ -281,17 +297,44 @@ CREATE TABLE notes (
 );
 ```
 
-### 4.3 Volltextsuche
+### 4.3 Multi-Repo
+
+Mehrere Repos teilen sich eine DB und werden zu einem **Workspace** gruppiert. Suchen laufen per Default über den ganzen Workspace, mit `--repo` lässt sich einschränken. Jeder Treffer trägt den Repo-Namen (`backend:src/Billing/TaxCalculator.cs:40`).
+
+Wichtig sind die **Kanten über Repo-Grenzen hinweg**, denn genau dort verliert ein Agent sonst die Spur:
+
+| Art | Wie erkannt | Beispiel |
+|-----|-------------|----------|
+| **Paket-Abhängigkeit** | Paketname aus `package.json`/`.csproj`/`composer.json` des einen Repos ↔ Abhängigkeit im anderen. Imports aus diesem Paket werden in das Quell-Repo aufgelöst statt als „extern“ markiert | Frontend importiert `@firma/shared-models` → Symbole im Repo `shared` |
+| **HTTP-API** | Server-Routen aus Attributen/Decorators (`[HttpGet("api/invoices/{id}")]`, `@Get()`), Client-Aufrufe aus `fetch`/`axios`/generierten Clients (URL-Muster normalisiert), optional OpenAPI-Spec als Brücke | `invoiceApi.get(id)` (TS) → `InvoicesController.Get(int id)` (C#) |
+| **Gemeinsame Verträge** | DTO-/Typnamen, die in beiden Repos vorkommen (Name-Match, niedrige Konfidenz), bzw. aus OpenAPI generierte Typen | `InvoiceDto` (C#) ↔ `InvoiceDto` (TS) |
+| **Messaging** (später) | Topic-/Queue-Namen als String-Literale in Publish/Subscribe-Aufrufen | `"invoice.created"` |
+
+Dafür kommt eine zusätzliche Tabelle für API-Endpunkte dazu:
+
+```sql
+CREATE TABLE endpoints (
+  id INTEGER PRIMARY KEY,
+  symbol_id INTEGER REFERENCES symbols(id) ON DELETE CASCADE,
+  role TEXT NOT NULL,          -- server|client
+  http_method TEXT, route_pattern TEXT NOT NULL,   -- normalisiert: /api/invoices/{}
+  confidence REAL DEFAULT 1.0
+);
+```
+
+Server- und Client-Endpunkte mit gleichem `(http_method, route_pattern)` werden zu `refs` mit `kind = 'http_call'` verbunden. Damit funktionieren `get_callers` und die Graph-Expansion über die Grenze zwischen Frontend und Backend hinweg.
+
+### 4.4 Volltextsuche
 
 - **SQLite**: `FTS5`-Virtual-Table über `symbols(name, qualified_name, signature, doc, summary)`, `doc_chunks(heading_path, text)` und optional Datei-Inhalt. Tokenizer `unicode61` mit `tokenchars '_'`, dazu eine eigene Vorverarbeitung, die `camelCase`/`snake_case` splittet, damit `InvoiceService` auch bei „invoice service“ trifft.
 - **PostgreSQL**: `tsvector` + GIN-Index, gleiche Vorverarbeitung.
 
-### 4.4 Vektorsuche
+### 4.5 Vektorsuche
 
 - **SQLite**: Extension [`sqlite-vec`](https://github.com/asg017/sqlite-vec). Fallback ohne Extension: Vektoren als BLOB laden und Brute-Force mit numpy. Bis ca. 100k Symbole ist das schnell genug.
 - **PostgreSQL**: `pgvector` mit HNSW-Index.
 
-### 4.5 Austauschbare Datenbank
+### 4.6 Austauschbare Datenbank
 
 - **SQLAlchemy Core** (nicht ORM) für Schema und Queries plus **Alembic** für Migrationen. Damit laufen SQLite, PostgreSQL, MySQL/MariaDB über dieselbe Codebasis.
 - DB-spezifische Features (FTS, Vektor) liegen hinter einem kleinen **Backend-Interface**:
@@ -426,16 +469,20 @@ Lokaler Zustand pro Projekt in `.wingman/` (DB, Cache, Config). Kommt in `.gitig
 
 ## 8. Roadmap
 
+Der Prototyp ist auf **einen Entwickler mit lokaler SQLite-DB** ausgelegt. Das Datenmodell wird aber von Anfang an so gebaut, dass Teilen später ohne Umbau möglich ist (siehe Abschnitt 10).
+
 | Phase | Inhalt | Ergebnis |
 |------|--------|----------|
-| **0 – Skeleton** | `pyproject`, CLI-Gerüst, Config, SQLite-Schema + Alembic | `wingman init` läuft |
-| **1 – Strukturindex** | Scanner, tree-sitter für Python + TS, Symbole, Imports, Refs, lokaler/Import-Resolver, FTS5 | `wingman symbol`, `callers`, `outline`, `search` (nur FTS) |
+| **0 – Skeleton** | `pyproject`, CLI-Gerüst, Config, SQLite-Schema + Alembic, Workspace/Repo-Verwaltung | `wingman init`, `wingman repo add` laufen |
+| **1 – Strukturindex** | Scanner, tree-sitter für **TypeScript + C#**, Symbole, Imports, Refs, lokaler/Import-Resolver (inkl. `tsconfig`-Pfade, C#-Namespaces), FTS5 | `wingman symbol`, `callers`, `outline`, `search` (nur FTS) |
 | **2 – MCP** | MCP-Server mit Kern-Tools, Context Pack, inkrementelles Indexing, Hooks | In Claude Code nutzbar |
-| **3 – Semantik** | Embeddings (lokal), sqlite-vec, Hybrid-Suche + RRF + Graph-Expansion | Bug-Report → relevante Stellen |
-| **4 – Summaries** | LLM-Enricher bottom-up, Cache, Budget, Datei-/Modul-Summaries | Undokumentierter Code wird durchsuchbar |
-| **5 – Externe Doku** | PDF/URL/MD-Ingest, Chunking, Auto-Linking | Spezifikationen hängen am Code |
-| **6 – Breite** | Weitere Sprachen (C#, Java, Go …), SCIP-Adapter, PostgreSQL-Backend, Notes | Produktionsreif für größere Codebasen |
-| **7 – Evaluation** | Benchmark: echte Issues/Commits aus OSS-Repos, Messung Recall@k der geänderten Dateien | Messbare Qualität, Tuning |
+| **3 – Multi-Repo** | Paket-Abhängigkeiten zwischen Repos, HTTP-Endpunkt-Matching (ASP.NET ↔ fetch/axios) | Agent folgt Aufrufen vom Frontend ins Backend |
+| **4 – Semantik** | Embeddings (lokal), sqlite-vec, Hybrid-Suche + RRF + Graph-Expansion | Bug-Report → relevante Stellen |
+| **5 – Summaries** | LLM-Enricher bottom-up (Anthropic, kleines Modell, Opt-in), Cache, Budget, Datei-/Modul-Summaries | Undokumentierter Code wird durchsuchbar |
+| **6 – Externe Doku** | PDF/URL/MD/OpenAPI-Ingest, Chunking, Auto-Linking | Spezifikationen hängen am Code |
+| **7 – Breite** | JavaScript, dann Java, Python, PHP; SCIP/Roslyn-Adapter; Notes | Alle Zielsprachen abgedeckt |
+| **8 – Teilen** | Export/Import-Format, CI-Build, PostgreSQL-Backend (siehe Abschnitt 10) | Team nutzt einen gemeinsamen Index |
+| **9 – Evaluation** | Benchmark: echte Issues/Commits, Recall@k der geänderten Dateien (läuft ab Phase 2 mit, wird hier ausgebaut) | Messbare Qualität, Tuning |
 
 ---
 
@@ -449,10 +496,77 @@ Die gute Nachricht: Git-Historien liefern Ground Truth gratis. Für jeden Bugfix
 
 ---
 
-## 10. Offene Fragen / Entscheidungen
+## 10. Teilen des Index im Team – Brainstorming
 
-1. **Embedding-Modell**: lokal (Datenschutz, kostenlos, schwächer) oder API (besser, Kosten, Code verlässt das Haus)? Vorschlag: lokal als Default, API optional.
-2. **LLM-Summaries**: Welcher Provider als Default, und mit welchem Kostenlimit? Vorschlag: Anthropic, ein günstiges kleines Modell, Opt-in per Config.
-3. **Multi-Repo**: Ein Index über mehrere Repos (Service-Landschaft) vom Start weg? Das Schema erlaubt es bereits über `repo_id`.
-4. **Sprachen-Priorität**: Welche Sprachen nutzt du am meisten? Davon hängt die Reihenfolge in Phase 1 und 6 ab.
-5. **Teilen des Index**: Lokal pro Entwickler oder zentral, z. B. per CI gebaut und als Artefakt oder Postgres bereitgestellt?
+Für den Prototyp reicht ein lokaler Index pro Entwickler. Die Kernfrage für später: **Was ist teuer zu erzeugen, und was ist billig?**
+
+| Bestandteil | Kosten | Folgerung |
+|-------------|--------|-----------|
+| Strukturindex (Symbole, Refs) | billig, Sekunden bis wenige Minuten, deterministisch | muss nicht geteilt werden, lokal neu bauen ist okay |
+| Embeddings | mittel (CPU/GPU-Zeit), deterministisch je Modell | Teilen lohnt sich bei großen Codebasen |
+| **LLM-Summaries** | **teuer** (Geld + Zeit), nicht deterministisch | **unbedingt teilen**, sonst bezahlt jeder Dev dieselben Summaries |
+| Externe Doku + Links, Notes | manuell kuratiert, wertvoll | **unbedingt teilen**, das ist Teamwissen |
+
+Daraus folgt das Leitprinzip: **Alles Teure wird inhaltsadressiert gespeichert**, d. h. der Schlüssel ist ein Hash des Inhalts (`body_hash + model + prompt_version`) und keine DB-ID oder Commit-ID. Dann gibt es beim Zusammenführen keine Konflikte, denn derselbe Code hat denselben Schlüssel, egal auf welchem Branch und bei welchem Dev. Gleiche Schlüssel mit unterschiedlichem Wert (zwei LLM-Läufe) sind harmlos: Man nimmt einen davon.
+
+### Option A – Über git: Export als Textdateien im Repo
+
+`wingman export` schreibt den teuren, geteilten Teil als **deterministisch sortierte JSONL-Dateien** in einen Ordner im Repo:
+
+```
+.wingman/shared/
+  summaries/ab/abcd1234….jsonl   # Shards nach Hash-Präfix, klein & merge-freundlich
+  docs/documents.jsonl           # externe Doku-Metadaten (URLs, Titel), PDFs per Git LFS oder nur Referenz
+  docs/links.jsonl               # Doku ↔ Code (über stable_key, nicht über IDs)
+  notes.jsonl
+  manifest.json                  # Format-Version, Modelle, Prompt-Versionen
+```
+
+- Nach `git pull` liest `wingman index` die Dateien ein, baut den Strukturindex lokal und übernimmt dabei vorhandene Summaries per Hash, statt sie neu zu erzeugen.
+- **Vorteile:** Keine Infrastruktur nötig, versioniert mit dem Code, Review per PR möglich, funktioniert offline und auf Branches.
+- **Nachteile:** Rauschen in der Git-Historie. Lösungen dafür: eigener Commit-Typ, Pfad in `.gitattributes` mit `linguist-generated` und `merge=union`, oder (siehe unten) ein separater Branch.
+- Embeddings eher **nicht** ins Repo (Binärdaten, groß), sondern lokal neu rechnen oder Variante C nutzen.
+
+**Variante A2 – eigener Branch:** Die gleichen Dateien landen nicht im Code-Branch, sondern auf einem Orphan-Branch `wingman-index` (oder in einem eigenen Repo). `wingman sync` holt bzw. pusht ihn. Die Code-Historie bleibt sauber, Teilen läuft trotzdem über dieselbe git-Infrastruktur und dieselben Rechte.
+
+### Option B – Gemeinsame Datenbank (PostgreSQL + pgvector)
+
+- Ein zentraler Server, alle Devs und die CI schreiben bzw. lesen.
+- **Das Branch-Problem:** Jeder Dev hat einen anderen Stand. Lösung über ein **Overlay-Modell**:
+  - Der zentrale Index bildet `main` (bzw. den Default-Branch) ab und wird von der CI bei jedem Merge aktualisiert.
+  - Jeder Dev hat lokal ein kleines SQLite-**Overlay** nur für die Dateien, die sich gegenüber `main` unterscheiden (`git diff --name-only origin/main`).
+  - Eine Abfrage fragt beide und lässt bei denselben Dateien das Overlay gewinnen.
+- **Vorteile:** Immer aktuell, kein Export-Schritt, gut für große Teams und viele Repos, Embedding-Suche zentral schnell.
+- **Nachteile:** Server-Betrieb, Zugangsdaten, nicht offline, Code-Inhalte (Summaries, Snippets) liegen in einer weiteren Datenbank, was Sicherheits- und Compliance-Fragen aufwirft.
+
+### Option C – CI-Artefakt
+
+- Die CI (z. B. GitHub Actions) baut bei jedem Push auf `main` den vollständigen Index inkl. Embeddings und Summaries und legt ihn als Artefakt oder Release-Asset ab (z. B. `index-<commit>.db.zst`).
+- `wingman pull-index` lädt den Index zum nächstgelegenen Vorfahren-Commit von `HEAD` und indexiert nur die Differenz lokal nach.
+- **Vorteile:** Keine eigene Infrastruktur, Devs müssen nie selbst LLM-Kosten erzeugen, schneller Start für neue Teammitglieder.
+- **Nachteile:** Download-Größe, und lokale Ergänzungen (Notes, Doku-Links) fließen nicht automatisch zurück. Für diese braucht es zusätzlich Option A.
+
+### Erste Einschätzung
+
+Die Optionen schließen sich nicht aus, sondern lassen sich stufenweise einführen:
+
+1. **Prototyp:** lokal, aber schon inhaltsadressiert und mit `stable_key` statt IDs bei Verknüpfungen. Das kostet jetzt fast nichts und macht alles Weitere möglich.
+2. **Erster Teamschritt:** **Option A2** (Orphan-Branch). Damit sind Summaries, Doku-Links und Notes geteilt, ohne neue Infrastruktur.
+3. **Bei Bedarf:** Option C für schnelle Bootstraps großer Repos, und **Option B** für Teams, die ohnehin eine zentrale DB betreiben wollen. Das Backend-Interface aus 4.6 ist darauf schon vorbereitet.
+
+Offene Punkte zum Weiterdiskutieren:
+- Sollen PDFs selbst geteilt werden (Git LFS) oder nur Referenzen darauf (Pfad im Netzlaufwerk, URL)?
+- Wer darf Notes schreiben? Nur Menschen, oder auch der Agent? Braucht es einen Review-Mechanismus?
+- Datenschutz: Dürfen generierte Summaries in eine zentrale DB, wenn der Code selbst sensibel ist?
+
+---
+
+## 11. Entscheidungen
+
+| # | Thema | Entscheidung |
+|---|-------|--------------|
+| 1 | Embedding-Modell | **Lokal als Default** (`sentence-transformers`, code-fähiges Modell), API-Provider optional per Config |
+| 2 | LLM-Summaries | **Anthropic als Default**, kleines und günstiges Modell, **Opt-in** per Config, mit Budget-Limit. Andere Provider (OpenAI-kompatibel, Ollama) über das Provider-Interface |
+| 3 | Multi-Repo | **Ja, von Anfang an**: Workspaces mit mehreren Repos in einer DB, Kanten über Repo-Grenzen (Pakete, HTTP-Endpunkte), siehe 4.3 |
+| 4 | Sprachen | **TypeScript + C#** im Prototyp, danach **JavaScript**, dann **Java, Python, PHP** |
+| 5 | Teilen | **Prototyp: ein Dev, lokale SQLite.** Datenmodell wird teilbar ausgelegt (inhaltsadressiert, `stable_key`). Teamlösung siehe Brainstorming in Abschnitt 10, Entscheidung später |
