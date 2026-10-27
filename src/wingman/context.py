@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from sqlalchemy import Connection
@@ -221,7 +222,10 @@ def find_relevant(
     limit: int = 8,
     include_code: bool = False,
     code_entries: int = 3,
+    semantic: Callable[[str], list[tuple[int, float]] | None] | None = None,
 ) -> ContextPack:
+    """``semantic`` maps text to ``(symbol_id, similarity)`` candidates (see
+    ``Workspace.semantic_search``); without it only full-text search is used."""
     signals = analyze_task(text)
     scores = _Scores()
     unknown_paths: list[str] = []
@@ -280,11 +284,16 @@ def find_relevant(
 
     # 4. full-text search over the whole text
     prose = "\n".join(line for line in text.splitlines() if not _is_frame_line(line))
-    fts = query.search(conn, workspace_id, _fts_text(prose), limit=25)
+    similar = semantic(prose) if semantic is not None and prose.strip() else None
+    fts = query.search(conn, workspace_id, _fts_text(prose), limit=25, semantic=similar)
     best = max((hit.score or 0.0 for hit in fts), default=0.0)
     for hit in fts:
         if best > 0:
-            scores.add(hit, 4.0 * (hit.score or 0.0) / best, "text match")
+            reason = {
+                "meaning": "similar meaning",
+                "text+meaning": "text match + similar meaning",
+            }.get(hit.matched_by or "", "text match")
+            scores.add(hit, 4.0 * (hit.score or 0.0) / best, reason)
 
     mentions_tests = bool(re.search(r"\btests?\b|\bspec\b", text, re.IGNORECASE))
     for symbol_id, hit in scores.hits.items():

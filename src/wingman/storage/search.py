@@ -48,7 +48,8 @@ def query_terms(query: str) -> list[str]:
         if lowered not in terms:
             terms.append(lowered)
         for word in identifier_words(token):
-            if word not in terms:
+            # fragments like "st" from "MwSt" would prefix-match half of the index
+            if len(word) >= 3 and word not in terms:
                 terms.append(word)
     return terms
 

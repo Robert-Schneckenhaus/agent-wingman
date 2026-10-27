@@ -135,6 +135,20 @@ Jede Referenz speichert den Namen, wie er im Code steht (`target_name`), sowie d
 - Lokal per Default (`sentence-transformers`, z. B. ein Code-fähiges Modell wie `jina-embeddings-v2-base-code` oder `bge-small`), damit Code das Haus nicht verlässt. Alternativ über eine API.
 - Gespeichert als Vektor plus `model`-Name. Ein Modellwechsel macht einen Re-Embed-Lauf nötig, und das ist erkennbar.
 
+> *Umgesetzt (Phase 4, vorgezogen):* `src/wingman/embeddings.py`.
+> - **Provider:** `fastembed` (ONNX, ohne PyTorch, ca. 65 MB) mit `BAAI/bge-small-en-v1.5` als Standard, optional über `pip install 'agent-wingman[embeddings]'`. Das Modell wird beim ersten Gebrauch von Hugging Face geladen. Weitere Provider (API, Code-Modelle) lassen sich über das `Embedder`-Protokoll ergänzen.
+> - **Konfiguration:** `[embeddings] enabled = "auto" | true | false`, `model`, `cache_dir`. Override per `WINGMAN_EMBEDDINGS=on|off|auto`.
+> - **Embedding-Text pro Symbol:** Art, qualifizierter Name, Name in Wörtern, Signatur, Doku, Pfad und Anfang des Bodies. Klassen bekommen statt des Bodys ihre Member-Namen. Maximal ca. 2.000 Zeichen.
+> - **Was eingebettet wird:** Klassen, Interfaces, Methoden, Funktionen, Komponenten und Tests. Felder, Properties und Konstanten nicht, sie werden über ihre Klasse gefunden.
+> - **Inhaltsadressiert:** Der Indexer speichert nur `symbols.embed_hash`, die Vektoren liegen in `embedding_cache(model, text_hash)`. Unveränderter Code wird nie zweimal eingebettet, auch nicht nach `--full`-Re-Indexierung oder auf einem anderen Branch. Das ist teilbar wie in Abschnitt 10.
+> - **Wann eingebettet wird:**
+>   - am Ende von `wingman index` und mit `wingman embed`,
+>   - im SessionStart-Hook mit max. 60 s,
+>   - vor einer semantischen Abfrage für fehlende Symbole mit max. 10 s.
+>   Der Post-Edit-Hook bettet nicht ein, damit er schnell bleibt.
+> - **Vektorsuche:** Brute-Force mit numpy über die normalisierten Vektoren, im Prozess gecacht, solange sich der Index nicht ändert. Gemessen: 19.500 Symbole, erste Abfrage 0,2 s, danach unter 0,05 s (ohne Modell-Inferenz). `sqlite-vec`/`pgvector` lohnen sich erst bei deutlich mehr Symbolen.
+> - **Fehlt das Modell** (offline, Download blockiert), degradiert die Suche zur reinen Volltextsuche mit Warnung statt Fehler.
+
 ### 3.7 Doc Ingestor – externe Doku
 
 | Quelle      | Werkzeug                                   |
@@ -359,6 +373,7 @@ Server- und Client-Endpunkte mit gleichem `(http_method, route_pattern)` werden 
 
 - **SQLite**: Extension [`sqlite-vec`](https://github.com/asg017/sqlite-vec). Fallback ohne Extension: Vektoren als BLOB laden und Brute-Force mit numpy. Bis ca. 100k Symbole ist das schnell genug.
 - **PostgreSQL**: `pgvector` mit HNSW-Index.
+- *Stand:* Bisher reicht Brute-Force mit numpy für beide Datenbanken (siehe 3.6), weil die Vektoren portabel als BLOB in `embedding_cache` liegen.
 
 ### 4.6 Austauschbare Datenbank
 
@@ -400,7 +415,7 @@ Für eine Anfrage wie einen Bug Report („Beim Export als PDF fehlt bei Rechnun
 > - **Volltext:** FTS5 mit Porter-Stemming („cancels“ findet „Cancelled“) über den Prosa-Teil ohne Frame-Zeilen.
 > - **Graph-Expansion:** 1 Hop zu Callern und Callees. Der Bonus ist gedeckelt, damit Nachbarn nie Symbole mit direkter Evidenz überholen.
 > - **Diversifizierung:** höchstens 2 Member pro Klasse, Abwertung von Membern, die nur über den Klassennamen passen, Dämpfung gleichnamiger Kopien aus mehreren Services.
-> - Fusion über gewichtete Summen statt RRF.
+> - **Fusion:** gewichtete Summen statt RRF. Mit Embeddings (Phase 4) liefert die Suche Volltext- und semantische Kandidaten, beide auf 0..1 normiert und 50/50 gewichtet. Treffer sind mit „text“, „meaning“ oder „text+meaning“ markiert, im Context Pack als „similar meaning“.
 > - **Bekannte Grenze:** Prosa ohne Bezeichner, die nah an *anderen* Klassennamen formuliert ist, findet die eigentliche Logik oft erst über die Graph-Expansion. Genau dafür ist die semantische Suche in Phase 4 gedacht.
 
 ### 5.2 Context Pack – Ausgabeformat für Agents
@@ -504,7 +519,7 @@ agent-wingman/
 │   ├── hooks.py                # Claude-Code-Hooks (post-edit, session-start)
 │   ├── claude_setup.py         # wingman claude install/uninstall
 │   ├── (später) enrich/        # LLM-Summaries, Provider-Interface
-│   ├── (später) embed/         # Embedding-Provider
+│   ├── embeddings.py           # Embedding-Texte, Provider, Vektor-Cache, semantische Suche
 │   ├── (später) docs/          # PDF/URL/MD-Ingest, Chunker, Linker
 │   ├── storage/
 │   │   ├── schema.py           # SQLAlchemy Core Tabellen
@@ -531,7 +546,7 @@ Der Prototyp ist auf **einen Entwickler mit lokaler SQLite-DB** ausgelegt. Das D
 | **1 – Strukturindex** ✅ | Scanner, tree-sitter für **TypeScript + C#**, Symbole, Imports, Refs, lokaler/Import-Resolver (inkl. `tsconfig`-Pfade, C#-Namespaces), FTS5 | `wingman index`, `search`, `symbol`, `callers`, `callees`, `outline` |
 | **2 – MCP** ✅ | MCP-Server mit Kern-Tools, Context Pack, inkrementelles Indexing, Hooks | In Claude Code nutzbar |
 | **3 – Multi-Repo** | Paket-Abhängigkeiten zwischen Repos, HTTP-Endpunkt-Matching (ASP.NET ↔ fetch/axios) | Agent folgt Aufrufen vom Frontend ins Backend |
-| **4 – Semantik** | Embeddings (lokal), sqlite-vec, Hybrid-Suche + RRF + Graph-Expansion | Bug-Report → relevante Stellen |
+| **4 – Semantik** ✅ (vorgezogen) | Embeddings (lokal, fastembed), inhaltsadressierter Vektor-Cache, Hybrid-Suche (gewichtete Fusion statt RRF) + Graph-Expansion. Noch offen: Qualitätsmessung mit echtem Modell, `sqlite-vec` erst bei Bedarf | Bug-Report → relevante Stellen |
 | **5 – Summaries** | LLM-Enricher bottom-up (Anthropic, kleines Modell, Opt-in), Cache, Budget, Datei-/Modul-Summaries | Undokumentierter Code wird durchsuchbar |
 | **6 – Externe Doku** | PDF/URL/MD/OpenAPI-Ingest, Chunking, Auto-Linking | Spezifikationen hängen am Code |
 | **7 – Breite** | JavaScript, dann Java, Python, PHP, dann **C/C++** (inkl. `compile_commands.json`, Header/Source-Zuordnung); SCIP/Roslyn/clang-Adapter; Notes | Alle Zielsprachen abgedeckt |

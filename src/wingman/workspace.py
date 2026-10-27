@@ -6,6 +6,7 @@ from pathlib import Path
 
 from sqlalchemy import Connection, Engine
 
+from wingman import embeddings
 from wingman.config import Config, ConfigError, load_config
 from wingman.storage import db, store
 
@@ -21,6 +22,10 @@ class Workspace:
         self._home = home
         self._config: Config | None = None
         self._engine: Engine | None = None
+        self._embedder: embeddings.Embedder | None = None
+        self._embedder_checked = False
+        self.warnings: list[str] = []
+        """Non-fatal problems (e.g. semantic search unavailable), for the caller to show."""
 
     @property
     def config(self) -> Config:
@@ -49,6 +54,41 @@ class Workspace:
             return store.get_workspace_id(conn, self.config.workspace)
         except store.StoreError as exc:
             raise WorkspaceError(str(exc)) from exc
+
+    @property
+    def embedder(self) -> embeddings.Embedder | None:
+        """The configured embedder; None if semantic search is off or unavailable."""
+        if not self._embedder_checked:
+            self._embedder_checked = True
+            try:
+                self._embedder = embeddings.create_embedder(self.config.embeddings)
+            except embeddings.EmbeddingError as exc:
+                self._warn(str(exc))
+        return self._embedder
+
+    def set_embedder(self, embedder: embeddings.Embedder | None) -> None:
+        """Use a specific embedder (tests, other providers)."""
+        self._embedder, self._embedder_checked = embedder, True
+
+    def semantic_search(self, text: str, limit: int = 200) -> list[tuple[int, float]] | None:
+        """Semantic candidates for ``text``, or None if unavailable (reason in warnings)."""
+        embedder = self.embedder
+        if embedder is None:
+            return None
+        with self.engine.connect() as conn:
+            workspace_id = self.workspace_id(conn)
+        try:
+            return embeddings.semantic_search(
+                self.engine, embedder, workspace_id, text, limit=limit
+            )
+        except embeddings.EmbeddingError as exc:
+            self._embedder = None  # do not retry a broken model in this process
+            self._warn(f"semantic search disabled: {exc}")
+            return None
+
+    def _warn(self, message: str) -> None:
+        if message not in self.warnings:
+            self.warnings.append(message)
 
     def repositories(self) -> list[store.RepoInfo]:
         with self.engine.connect() as conn:

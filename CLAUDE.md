@@ -24,6 +24,9 @@ uv venv && uv pip install -e ".[dev]"   # or: python -m venv .venv && pip instal
 - `src/wingman/resolver.py` – resolves imports, refs, inheritance; builds `symbol_edges`
 - `src/wingman/query.py` – read side used by CLI and MCP server
 - `src/wingman/context.py` – bug report/task text -> signals -> ranked context pack
+- `src/wingman/embeddings.py` – embedding texts, providers (fastembed), content-addressed
+  vector cache, semantic search; tests use a deterministic fake embedder and
+  `WINGMAN_EMBEDDINGS=off` (set in `tests/conftest.py`), so no model is downloaded
 - `src/wingman/render.py` – text output shared by CLI and MCP server
 - `src/wingman/notes.py` – notes on symbols/files/directories (keyed by stable keys)
 - `src/wingman/workspace.py` – config + engine access shared by CLI, MCP server, hooks

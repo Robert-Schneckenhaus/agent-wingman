@@ -142,11 +142,17 @@ symbols = Table(
         nullable=False,
         comment="repo + path + qualified_name + kind (+ signature for overloads)",
     ),
+    Column(
+        "embed_hash",
+        String(64),
+        comment="Hash of the text embedded for this symbol; key into embedding_cache",
+    ),
     Index(None, "name"),
     Index(None, "qualified_name"),
     Index(None, "file_id"),
     Index(None, "parent_id"),
     Index(None, "stable_key", unique=True),
+    Index(None, "embed_hash"),
 )
 
 symbol_locations = Table(
@@ -289,6 +295,18 @@ embeddings = Table(
     Column("dim", Integer, nullable=False),
     Column("vector", LargeBinary, nullable=False, comment="float32 array"),
     Column("text_hash", String(64)),
+)
+
+# Content-addressed: the same text is embedded once per model, no matter how often
+# symbols are re-indexed or on which branch/machine (CONCEPT.md section 10).
+embedding_cache = Table(
+    "embedding_cache",
+    metadata,
+    Column("model", String(200), primary_key=True),
+    Column("text_hash", String(64), primary_key=True),
+    Column("dim", Integer, nullable=False),
+    Column("vector", LargeBinary, nullable=False, comment="float32, L2-normalized"),
+    _created_at(),
 )
 
 summary_cache = Table(

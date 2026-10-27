@@ -32,6 +32,8 @@ class SymbolHit:
     is_generated: bool
     parent_id: int | None = None
     score: float | None = None
+    matched_by: str | None = None
+    """For search results: "text", "meaning" or "text+meaning"."""
 
     @property
     def location(self) -> str:
@@ -209,13 +211,21 @@ def search(
     kinds: set[str] | None = None,
     include_tests: bool = True,
     limit: int = 10,
+    semantic: list[tuple[int, float]] | None = None,
+    semantic_weight: float = 0.5,
 ) -> list[SymbolHit]:
+    """Full-text search, optionally fused with semantic candidates
+    (``(symbol_id, similarity)`` from ``embeddings.semantic_search``)."""
     candidates = backend_for(conn).search(conn, query, limit=max(limit * 20, 200))
-    if not candidates:
-        return []
     scores = dict(candidates)
+    meaning = _normalize_similarities(semantic or [])
+    if not scores and not meaning:
+        return []
+    best_text = max(scores.values(), default=0.0) or 1.0
     rows = conn.execute(
-        _scope(_hit_query(), workspace_id, repo, kinds).where(symbols.c.id.in_(list(scores)))
+        _scope(_hit_query(), workspace_id, repo, kinds).where(
+            symbols.c.id.in_(list(set(scores) | set(meaning)))
+        )
     )
     words = {w.lower() for w in query.split()}
     terms = query_terms(query)
@@ -224,7 +234,6 @@ def search(
     for row in rows:
         if row.is_test and not include_tests:
             continue
-        score = scores[row.id]
         own = searchable(f"{row.name} {row.signature or ''} {row.summary or ''}").lower()
         if any(t in own for t in terms):
             own_match.add(row.id)
@@ -233,7 +242,18 @@ def search(
             f"{row.qualified_name} {row.signature or ''} {row.summary or ''} {row.path}"
         ).lower()
         coverage = sum(1 for t in terms if t in haystack) / len(terms) if terms else 1.0
-        score *= 0.5 + coverage
+        lexical = scores.get(row.id, 0.0) * (0.5 + coverage)
+        if meaning:  # both parts scaled to 0..10 before weighting
+            text_part = 10 * lexical / (1.5 * best_text)
+            meaning_part = 10 * meaning.get(row.id, 0.0)
+            score = (1 - semantic_weight) * text_part + semantic_weight * meaning_part
+            matched_by = "+".join(
+                label
+                for label, part in (("text", text_part), ("meaning", meaning_part))
+                if part > 0
+            )
+        else:
+            score, matched_by = lexical, "text"
         if row.name.lower() in words or row.qualified_name.lower() in words:
             score *= 1.5
         if row.is_test:
@@ -244,8 +264,21 @@ def search(
             score *= 0.7
         if row.kind == "constructor":  # same name as its class, which should win
             score *= 0.5
-        hits.append(_hit(row, round(score, 3)))
+        hit = _hit(row, round(score, 3))
+        hit.matched_by = matched_by
+        hits.append(hit)
     return _diversify(hits, limit, own_match)
+
+
+def _normalize_similarities(semantic: list[tuple[int, float]]) -> dict[int, float]:
+    """Min-max scale similarities of the candidate list to 0..1 (models differ a lot in
+    their absolute cosine ranges)."""
+    if not semantic:
+        return {}
+    values = [s for _, s in semantic]
+    low, high = min(values), max(values)
+    span = high - low
+    return {i: (s - low) / span if span > 1e-9 else 1.0 for i, s in semantic}
 
 
 MAX_MEMBERS_PER_PARENT = 2

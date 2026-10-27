@@ -11,7 +11,17 @@ import click
 from sqlalchemy import Engine
 from sqlalchemy.exc import DBAPIError, NoSuchModuleError
 
-from wingman import __version__, claude_setup, context, git, hooks, notes, query, render
+from wingman import (
+    __version__,
+    claude_setup,
+    context,
+    embeddings,
+    git,
+    hooks,
+    notes,
+    query,
+    render,
+)
 from wingman.config import (
     CONFIG_FILE,
     DEFAULT_DB_FILE,
@@ -123,6 +133,13 @@ def status(app: AppContext) -> None:
         f"Index:     {stats.files} files, {stats.symbols} symbols, "
         f"{stats.resolved_refs}/{stats.refs} references resolved"
     )
+    embedder = app.embedder
+    if embedder is not None:
+        with engine.connect() as conn:
+            done, total = embeddings.coverage(conn, app.workspace_id(conn), embedder.model)
+        click.echo(f"Semantic:  {done}/{total} symbols embedded ({embedder.model})")
+    else:
+        click.echo("Semantic:  off" + (f" ({app.warnings[0]})" if app.warnings else ""))
     click.echo(f"Repositories: {len(repos)}")
     for repo in repos:
         indexed = repo.last_commit[:10] if repo.last_commit else "-"
@@ -205,9 +222,11 @@ def repo_remove(app: AppContext, name: str) -> None:
 @main.command()
 @click.argument("names", nargs=-1)
 @click.option("--full", is_flag=True, help="Re-index all files, not only changed ones.")
+@click.option("--no-embed", is_flag=True, help="Skip computing embeddings afterwards.")
 @pass_app
-def index(app: AppContext, names: tuple[str, ...], full: bool) -> None:
-    """Index repositories (default: all). Only changed files are re-parsed."""
+def index(app: AppContext, names: tuple[str, ...], full: bool, no_embed: bool) -> None:
+    """Index repositories (default: all). Only changed files are re-parsed; embeddings
+    are computed afterwards when semantic search is enabled."""
     engine = app.engine
     with engine.connect() as conn:
         repos = store.list_repositories(conn, app.workspace_id(conn))
@@ -239,8 +258,58 @@ def index(app: AppContext, names: tuple[str, ...], full: bool) -> None:
             click.echo(f"  warning: {error}", err=True)
         if len(stats.errors) > 5:
             click.echo(f"  ... {len(stats.errors) - 5} more warnings", err=True)
+    if not no_embed:
+        _embed(app, max_seconds=None, quiet_if_disabled=True)
+    _echo_warnings(app)
     if failed:
         raise SystemExit(1)
+
+
+def _embed(app: AppContext, *, max_seconds: float | None, quiet_if_disabled: bool) -> None:
+    embedder = app.embedder
+    if embedder is None:
+        if not quiet_if_disabled:
+            raise click.ClickException(
+                "Semantic search is disabled or unavailable"
+                + (f": {app.warnings[0]}" if app.warnings else ".")
+            )
+        return
+    with app.engine.connect() as conn:
+        workspace_id = app.workspace_id(conn)
+    try:
+        stats = embeddings.ensure_embeddings(
+            app.engine,
+            embedder,
+            workspace_id,
+            max_seconds=max_seconds,
+            progress=lambda m: click.echo(m, err=True),
+        )
+    except embeddings.EmbeddingError as exc:
+        if not quiet_if_disabled:
+            raise click.ClickException(str(exc)) from exc
+        click.echo(f"warning: embeddings skipped: {exc}", err=True)
+        return
+    if stats.pending or not quiet_if_disabled:
+        rest = stats.pending - stats.embedded
+        click.echo(
+            f"embeddings ({embedder.model}): {stats.embedded} computed"
+            + (f", {rest} still missing" if rest else "")
+            + (f", {stats.skipped} skipped (files changed, re-index)" if stats.skipped else "")
+            + f"; {stats.seconds}s"
+        )
+
+
+def _echo_warnings(app: AppContext) -> None:
+    for warning in app.warnings:
+        click.echo(f"warning: {warning}", err=True)
+
+
+@main.command("embed")
+@click.option("--max-seconds", type=float, help="Stop after this many seconds.")
+@pass_app
+def embed_cmd(app: AppContext, max_seconds: float | None) -> None:
+    """Compute missing embeddings for semantic search."""
+    _embed(app, max_seconds=max_seconds, quiet_if_disabled=False)
 
 
 # --- queries -------------------------------------------------------------------
@@ -269,26 +338,38 @@ def _resolve_symbols(
     return lookup.found
 
 
+semantic_option = click.option(
+    "--semantic/--no-semantic",
+    default=True,
+    help="Combine full-text with semantic search (when embeddings are available).",
+)
+
+
 @main.command("search")
 @click.argument("text", nargs=-1, required=True)
 @click.option("--limit", "-n", default=10, show_default=True)
 @click.option("--no-tests", is_flag=True, help="Exclude symbols from test files.")
 @repo_option
 @kind_option
+@semantic_option
 @json_option
 @pass_app
-def search_cmd(app, text, limit, no_tests, repo, kinds, as_json) -> None:
-    """Full-text search over symbol names, signatures, docs and paths."""
+def search_cmd(app, text, limit, no_tests, repo, kinds, semantic, as_json) -> None:
+    """Search symbol names, signatures, docs and paths (full-text + semantic)."""
+    text = " ".join(text)
+    similar = app.semantic_search(text) if semantic else None
     with app.engine.connect() as conn:
         hits = query.search(
             conn,
             app.workspace_id(conn),
-            " ".join(text),
+            text,
             repo=repo,
             kinds=set(kinds) or None,
             include_tests=not no_tests,
             limit=limit,
+            semantic=similar,
         )
+    _echo_warnings(app)
     if as_json:
         _echo_json([h.to_dict() for h in hits])
     else:
@@ -303,18 +384,25 @@ def search_cmd(app, text, limit, no_tests, repo, kinds, as_json) -> None:
 @click.option("--limit", "-n", default=8, show_default=True, help="Number of symbols.")
 @click.option("--budget", default=4000, show_default=True, help="Approximate token budget.")
 @click.option("--code", is_flag=True, help="Include source code of the top symbols.")
+@semantic_option
 @json_option
 @pass_app
-def context_cmd(app, task, task_file, limit, budget, code, as_json) -> None:
+def context_cmd(app, task, task_file, limit, budget, code, semantic, as_json) -> None:
     """Relevant code for a bug report or task (identifiers, stack traces, full text)."""
     text = task_file.read() if task_file else " ".join(task)
     if not text.strip():
         raise click.UsageError("Give the task as arguments or with --file.")
     with app.engine.connect() as conn:
         pack = context.find_relevant(
-            conn, app.workspace_id(conn), text, limit=limit, include_code=code
+            conn,
+            app.workspace_id(conn),
+            text,
+            limit=limit,
+            include_code=code,
+            semantic=app.semantic_search if semantic else None,
         )
         output = pack.to_dict() if as_json else context.render_pack(pack, budget=budget)
+    _echo_warnings(app)
     if as_json:
         _echo_json(output)
     else:

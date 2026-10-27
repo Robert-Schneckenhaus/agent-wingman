@@ -6,14 +6,17 @@ reports them on stderr only.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 
+from wingman import embeddings
 from wingman.indexer import index_repository
 from wingman.query import workspace_stats
 from wingman.workspace import Workspace
 
 EDIT_PATH_KEYS = ("file_path", "notebook_path", "path")
+SESSION_EMBED_SECONDS = 60  # the SessionStart hook timeout is 120 s
 
 
 def edited_paths(payload: dict) -> list[Path]:
@@ -52,8 +55,17 @@ def session_start(ws: Workspace) -> str:
         except Exception:  # a missing repository must not block the others
             continue
         changed += stats.files_indexed + stats.files_removed
+    embedder = ws.embedder
     with ws.engine.connect() as conn:
-        stats = workspace_stats(conn, ws.workspace_id(conn))
+        workspace_id = ws.workspace_id(conn)
+    if embedder is not None:
+        # bounded, so the session never waits long; the rest follows later
+        with contextlib.suppress(embeddings.EmbeddingError):
+            embeddings.ensure_embeddings(
+                ws.engine, embedder, workspace_id, max_seconds=SESSION_EMBED_SECONDS
+            )
+    with ws.engine.connect() as conn:
+        stats = workspace_stats(conn, workspace_id)
     return (
         f"agent-wingman: code index ready ({stats.repos} repos, {stats.files} files, "
         f"{stats.symbols} symbols; {changed} files updated just now). Use the wingman MCP "

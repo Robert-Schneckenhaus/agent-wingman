@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import time
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -11,8 +11,8 @@ from pathlib import Path
 
 from sqlalchemy import Connection, Engine, case, delete, func, insert, select, update
 
-from wingman import git
-from wingman.extract import EXTRACTOR_VERSION, extract
+from wingman import embeddings, git
+from wingman.extract import content_hash, extract
 from wingman.extract.base import short_hash
 from wingman.extract.model import Extraction
 from wingman.resolver import resolve_repository
@@ -92,9 +92,9 @@ def index_repository(
             except OSError as exc:
                 stats.errors.append(f"{source.path}: {exc}")
                 continue
-            content_hash = hashlib.sha256(EXTRACTOR_VERSION.encode() + b"\0" + data).hexdigest()
+            file_hash = content_hash(data)
             previous = existing.get(source.path)
-            if previous is not None and previous[1] == content_hash and not full:
+            if previous is not None and previous[1] == file_hash and not full:
                 stats.files_unchanged += 1
                 continue
             if previous is not None:
@@ -104,7 +104,7 @@ def index_repository(
             except Exception as exc:  # a broken file must not stop the run
                 stats.errors.append(f"{source.path}: extraction failed: {exc}")
                 extraction = Extraction()
-            counts = _store_file(conn, backend, repo, source, data, content_hash, extraction)
+            counts = _store_file(conn, backend, repo, source, data, file_hash, extraction)
             stats.files_indexed += 1
             stats.symbols += counts[0]
             stats.refs += counts[1]
@@ -196,7 +196,11 @@ def _store_file(
     ids: list[int] = []
     keys: set[str] = set()
     fts_rows: list[FtsRow] = []
+    members: dict[int, list] = defaultdict(list)
     for sym in extraction.symbols:
+        if sym.parent is not None:
+            members[sym.parent].append(sym)
+    for index, sym in enumerate(extraction.symbols):
         key = stable_key(repo.name, source.path, sym.qualified_name, sym.kind)
         if key in keys:  # overloads / duplicate declarations
             key = f"{key}~{short_hash((sym.signature or '').encode())[:8]}"
@@ -226,6 +230,7 @@ def _store_file(
                 summary=_first_sentence(sym.doc),
                 summary_source="docstring" if sym.doc else None,
                 stable_key=key,
+                embed_hash=_embed_hash(sym, source.path, data, members.get(index, [])),
             )
         ).inserted_primary_key[0]
         ids.append(symbol_id)
@@ -271,6 +276,21 @@ def _store_file(
             ],
         )
     return len(ids), len(extraction.refs)
+
+
+def _embed_hash(sym, path: str, data: bytes, members: list) -> str | None:
+    if sym.kind not in embeddings.EMBED_KINDS:
+        return None
+    text = embeddings.embedding_text(
+        kind=sym.kind,
+        qualified_name=sym.qualified_name,
+        signature=sym.signature,
+        doc=sym.doc,
+        path=path,
+        body=embeddings.body_text(data, sym.start_byte, sym.end_byte),
+        members=[m.name for m in sorted(members, key=lambda m: m.start_byte)],
+    )
+    return embeddings.text_hash(text)
 
 
 def _first_sentence(doc: str | None, limit: int = 200) -> str | None:

@@ -34,6 +34,11 @@ def create_server(home: Path | None = None, workspace: Workspace | None = None) 
         "wingman", instructions=INSTRUCTIONS, version=__version__, log_level="WARNING"
     )
 
+    def with_warnings(text: str) -> str:
+        if not ws.warnings:
+            return text
+        return text + "\n\n(" + "; ".join(ws.warnings) + ")"
+
     def lookup(conn, name: str):
         """Resolve a symbol name; returns (hits, None) or (None, message)."""
         result = queries.resolve_name(conn, ws.workspace_id(conn), name)
@@ -54,9 +59,14 @@ def create_server(home: Path | None = None, workspace: Workspace | None = None) 
         """
         with ws.engine.connect() as conn:
             pack = context.find_relevant(
-                conn, ws.workspace_id(conn), task, limit=limit, include_code=include_code
+                conn,
+                ws.workspace_id(conn),
+                task,
+                limit=limit,
+                include_code=include_code,
+                semantic=ws.semantic_search,
             )
-            return context.render_pack(pack, budget=budget_tokens)
+            return with_warnings(context.render_pack(pack, budget=budget_tokens))
 
     @server.tool(annotations=READ_ONLY)
     def search_code(
@@ -66,9 +76,11 @@ def create_server(home: Path | None = None, workspace: Workspace | None = None) 
         kind: str | None = None,
         include_tests: bool = True,
     ) -> str:
-        """Full-text search over symbol names (camelCase/snake_case aware), signatures,
-        documentation and file paths. ``kind`` filters e.g. class, method, function,
-        interface, property, component."""
+        """Search symbols by words or a description: full-text over names (camelCase /
+        snake_case aware), signatures, docs and paths, combined with semantic similarity
+        when embeddings are enabled. ``kind`` filters e.g. class, method, function,
+        interface, property, component, test."""
+        similar = ws.semantic_search(query)
         with ws.engine.connect() as conn:
             hits = queries.search(
                 conn,
@@ -78,8 +90,9 @@ def create_server(home: Path | None = None, workspace: Workspace | None = None) 
                 kinds={kind} if kind else None,
                 include_tests=include_tests,
                 limit=limit,
+                semantic=similar,
             )
-            return render.hits(hits)
+            return with_warnings(render.hits(hits))
 
     @server.tool(annotations=READ_ONLY)
     def get_symbol(name: str, include_code: bool = False) -> str:

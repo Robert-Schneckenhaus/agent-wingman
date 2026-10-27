@@ -7,7 +7,7 @@ from click.testing import CliRunner
 from sqlalchemy import Engine
 
 from wingman.cli import main
-from wingman.config import ENV_DB, ENV_HOME
+from wingman.config import ENV_DB, ENV_EMBEDDINGS, ENV_HOME
 from wingman.indexer import index_repository
 from wingman.storage import db, store
 
@@ -18,6 +18,8 @@ FIXTURES = Path(__file__).parent / "fixtures"
 def _isolated_env(monkeypatch):
     monkeypatch.delenv(ENV_HOME, raising=False)
     monkeypatch.delenv(ENV_DB, raising=False)
+    # no model downloads in tests; embedding tests inject a deterministic embedder
+    monkeypatch.setenv(ENV_EMBEDDINGS, "off")
 
 
 @pytest.fixture

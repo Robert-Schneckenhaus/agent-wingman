@@ -19,6 +19,7 @@ Requires Python 3.11+.
 ```bash
 pip install -e ".[dev]"          # from a checkout
 pip install -e ".[postgres]"     # optional PostgreSQL driver
+pip install -e ".[embeddings]"   # optional semantic search (local model via fastembed)
 ```
 
 ## Usage
@@ -72,6 +73,24 @@ wingman note add TaxCalculator.Breakdown "Discount is applied before tax (#123)"
 wingman note add backend:src/Api "Controllers must call Audit()"
 wingman reindex src/billing/tax.ts        # single files, e.g. after a git checkout
 ```
+
+### Semantic search
+
+With the `embeddings` extra installed, search and context packs also find code by
+meaning, not only by matching words: synonyms, paraphrased bug reports, or a German
+description of English code. The default model `BAAI/bge-small-en-v1.5` runs locally (ONNX, no
+GPU needed) and is downloaded from Hugging Face on first use; code never leaves the
+machine. Embeddings are computed at the end of `wingman index` (or with
+`wingman embed`) and cached by content, so unchanged code is never embedded twice.
+
+```toml
+[embeddings]
+enabled = "auto"          # auto | true | false   (env: WINGMAN_EMBEDDINGS=on|off|auto)
+model = "BAAI/bge-small-en-v1.5"
+```
+
+`--no-semantic` on `search`/`context` uses full-text search only. Without the model
+(offline, blocked download) everything keeps working with full-text search and a warning.
 
 Every query command accepts `--json` for machine-readable output. Symbol names can
 be simple names, qualified-name suffixes (`Class.member`) or full qualified names.

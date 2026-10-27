@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache
@@ -10,9 +11,14 @@ from tree_sitter import Language, Parser
 
 from wingman.extract.model import Extraction
 
-# Bump when extractors change what they produce: it is part of every file's content
-# hash, so the next `wingman index` re-parses all files.
-EXTRACTOR_VERSION = "2"
+# Bump when extractors (or the indexer) change what they produce: it is part of every
+# file's content hash, so the next `wingman index` re-parses all files.
+EXTRACTOR_VERSION = "3"
+
+
+def content_hash(data: bytes) -> str:
+    """Hash stored in ``files.content_hash``: file content + extractor version."""
+    return hashlib.sha256(EXTRACTOR_VERSION.encode() + b"\0" + data).hexdigest()
 
 
 @dataclass(frozen=True)

@@ -21,10 +21,23 @@ DEFAULT_DB_FILE = "index.db"
 
 ENV_HOME = "WINGMAN_HOME"
 ENV_DB = "WINGMAN_DB"
+ENV_EMBEDDINGS = "WINGMAN_EMBEDDINGS"  # on | off | auto, overrides embeddings.enabled
 
 
 class ConfigError(Exception):
     """Raised when no usable workspace configuration can be found."""
+
+
+DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+
+
+@dataclass(frozen=True)
+class EmbeddingConfig:
+    enabled: bool | None = None
+    """True/False, or None for "auto": on when an embedding provider is installed."""
+    model: str = DEFAULT_EMBEDDING_MODEL
+    cache_dir: Path | None = None
+    """Where models are downloaded to (default: ~/.cache/wingman/models)."""
 
 
 @dataclass(frozen=True)
@@ -33,6 +46,7 @@ class Config:
     """The ``.wingman`` directory."""
     workspace: str
     db_url: str
+    embeddings: EmbeddingConfig = EmbeddingConfig()
 
     @property
     def root(self) -> Path:
@@ -87,7 +101,27 @@ def load_config(home: Path | None = None) -> Config:
     workspace = data.get("workspace", {}).get("name") or home.parent.name
     db_url = os.environ.get(ENV_DB) or data.get("database", {}).get("url")
     db_url = resolve_db_url(db_url, home.parent) if db_url else default_db_url(home)
-    return Config(home=home, workspace=workspace, db_url=db_url)
+    return Config(
+        home=home,
+        workspace=workspace,
+        db_url=db_url,
+        embeddings=_embedding_config(data.get("embeddings", {}), config_path),
+    )
+
+
+def _embedding_config(section: dict, config_path: Path) -> EmbeddingConfig:
+    enabled = section.get("enabled", "auto")
+    override = os.environ.get(ENV_EMBEDDINGS, "").strip().lower()
+    if override:
+        enabled = {"on": True, "true": True, "off": False, "false": False}.get(override, "auto")
+    if enabled not in (True, False, "auto"):
+        raise ConfigError(f'{config_path}: embeddings.enabled must be true, false or "auto"')
+    cache_dir = section.get("cache_dir")
+    return EmbeddingConfig(
+        enabled=None if enabled == "auto" else enabled,
+        model=section.get("model", DEFAULT_EMBEDDING_MODEL),
+        cache_dir=Path(cache_dir).expanduser() if cache_dir else None,
+    )
 
 
 def render_config(workspace: str, db_url: str | None = None) -> str:
@@ -105,4 +139,11 @@ name = "{workspace}"
 # against the directory containing .wingman/. WINGMAN_DB overrides this value.
 {db_line}
 # url = "postgresql+psycopg://user:password@host/wingman"
+
+[embeddings]
+# Semantic search with a local embedding model (pip install 'agent-wingman[embeddings]').
+# "auto" enables it when the provider is installed; the model is downloaded on first use.
+# enabled = "auto"
+# model = "{DEFAULT_EMBEDDING_MODEL}"
+# cache_dir = "~/.cache/wingman/models"
 """

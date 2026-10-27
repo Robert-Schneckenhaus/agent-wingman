@@ -13,6 +13,7 @@ dependencies = [
     "alembic>=1.13",
     "click>=8.1",
     "mcp>=2.0",
+    "numpy>=1.26",
     "pathspec>=0.12",
     "sqlalchemy>=2.0",
     "tree-sitter>=0.23",
@@ -22,6 +23,7 @@ dependencies = [
 
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.1"]
+embeddings = ["fastembed>=0.4"]
 dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]
