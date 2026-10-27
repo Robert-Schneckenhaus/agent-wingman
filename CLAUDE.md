@@ -16,8 +16,15 @@ uv venv && uv pip install -e ".[dev]"   # or: python -m venv .venv && pip instal
 - `src/wingman/config.py` – finds `.wingman/config.toml`, resolves DB URL
 - `src/wingman/storage/schema.py` – SQLAlchemy Core schema (single source of truth)
 - `src/wingman/storage/migrations/` – Alembic migrations
-- `src/wingman/storage/store.py` – data access functions
-- `tests/` – pytest; `tests/test_migrations.py` fails if schema and migrations diverge
+- `src/wingman/storage/store.py` – data access for workspaces/repositories
+- `src/wingman/storage/search.py` – search backends (SQLite FTS5, LIKE fallback)
+- `src/wingman/scanner.py` – which files get indexed
+- `src/wingman/extract/` – tree-sitter visitors per language (`typescript.py`, `csharp.py`)
+- `src/wingman/indexer.py` – incremental indexing (hash compare, store, FTS)
+- `src/wingman/resolver.py` – resolves imports, refs, inheritance; builds `symbol_edges`
+- `src/wingman/query.py` – read side used by the CLI (later the MCP server)
+- `tests/` – pytest; `tests/test_migrations.py` fails if schema and migrations diverge;
+  `tests/fixtures/{ts_app,cs_app}` are small repos with known expected resolutions
 
 ## Schema changes
 
@@ -30,6 +37,9 @@ uv venv && uv pip install -e ".[dev]"   # or: python -m venv .venv && pip instal
    ```
 3. Review the generated file (replace SQLite-specific defaults such as
    `sa.text('(CURRENT_TIMESTAMP)')` with `sa.func.now()`), then run the tests.
+   If the change affects what the extractor stores, add
+   `op.execute("UPDATE files SET content_hash = ''")` so the next index re-parses.
+4. SQLite does not detect column comment changes; check PostgreSQL if possible.
 
 ## Conventions
 

@@ -100,6 +100,7 @@ files = Table(
     Column("is_test", Boolean, nullable=False, server_default="0"),
     Column("is_generated", Boolean, nullable=False, server_default="0"),
     Column("last_modified", DateTime(timezone=True)),
+    Column("namespaces", JSON, comment="Namespaces declared in the file (C#)"),
     UniqueConstraint("repo_id", "path"),
 )
 
@@ -118,6 +119,11 @@ symbols = Table(
     Column("name", Text, nullable=False),
     Column("qualified_name", Text, nullable=False),
     Column("signature", Text),
+    Column(
+        "type_name",
+        Text,
+        comment="Declared value type (field/property type, unwrapped return type)",
+    ),
     Column("visibility", String(20)),
     Column("modifiers", JSON),
     Column("decorators", JSON),
@@ -139,6 +145,7 @@ symbols = Table(
     Index(None, "name"),
     Index(None, "qualified_name"),
     Index(None, "file_id"),
+    Index(None, "parent_id"),
     Index(None, "stable_key", unique=True),
 )
 
@@ -151,6 +158,7 @@ symbol_locations = Table(
     Column("start_line", Integer),
     Column("end_line", Integer),
     Index(None, "symbol_id"),
+    Index(None, "file_id"),
 )
 
 refs = Table(
@@ -160,12 +168,14 @@ refs = Table(
     Column("from_symbol_id", Integer, ForeignKey("symbols.id", ondelete="CASCADE")),
     Column("from_file_id", Integer, ForeignKey("files.id", ondelete="CASCADE"), nullable=False),
     Column("to_symbol_id", Integer, ForeignKey("symbols.id", ondelete="SET NULL")),
-    Column("unresolved_name", Text),
+    Column("target_name", Text, nullable=False, comment="Name as written in the code"),
+    Column("qualifier", Text, comment="Receiver as written: this, base, _calc, ns, Type"),
+    Column("qualifier_type", Text, comment="Declared type of the receiver, if known"),
     Column(
         "kind",
         String(20),
         nullable=False,
-        comment="call|instantiate|type_ref|read|write|import|http_call",
+        comment="call|instantiate|type_ref|inherits|implements|http_call",
     ),
     Column("line", Integer),
     Column("col", Integer),
@@ -174,6 +184,7 @@ refs = Table(
     Index(None, "to_symbol_id"),
     Index(None, "from_symbol_id"),
     Index(None, "from_file_id"),
+    Index(None, "target_name"),
 )
 
 symbol_edges = Table(
@@ -183,6 +194,7 @@ symbol_edges = Table(
     Column("dst_id", Integer, ForeignKey("symbols.id", ondelete="CASCADE"), primary_key=True),
     Column("kind", String(20), primary_key=True, comment="inherits|implements|overrides|tests"),
     Column("confidence", Float, nullable=False, server_default="1.0"),
+    Index(None, "dst_id"),
 )
 
 imports = Table(
@@ -195,7 +207,15 @@ imports = Table(
     Column("imported_name", Text),
     Column("resolved_file_id", Integer, ForeignKey("files.id", ondelete="SET NULL")),
     Column("line", Integer),
+    Column(
+        "kind",
+        String(20),
+        nullable=False,
+        server_default="import",
+        comment="import|reexport|using|using_static|global_using",
+    ),
     Index(None, "file_id"),
+    Index(None, "resolved_file_id"),
 )
 
 endpoints = Table(
@@ -208,6 +228,7 @@ endpoints = Table(
     Column("route_pattern", Text, nullable=False, comment="Normalized, e.g. /api/invoices/{}"),
     Column("confidence", Float, nullable=False, server_default="1.0"),
     Index(None, "route_pattern"),
+    Index(None, "symbol_id"),
 )
 
 # --- External documentation ----------------------------------------------------

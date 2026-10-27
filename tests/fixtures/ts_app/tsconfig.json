@@ -1,0 +1,9 @@
+{
+  // path aliases like in a typical Angular/React project
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@shared/*": ["src/shared/*"],
+    },
+  },
+}

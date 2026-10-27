@@ -71,7 +71,8 @@ Begründung: `tree-sitter` hat gute Python-Bindings (`tree-sitter-language-pack`
 ### 3.2 Parser (tree-sitter)
 
 - Einheitlicher Zugang über **tree-sitter** für alle Sprachen: robust bei Syntaxfehlern, schnell, inkrementell.
-- Pro Sprache eine **Query-Datei** (`queries/<lang>/symbols.scm`, `refs.scm`), ähnlich den `tags.scm` von GitHub/nvim. Neue Sprachen kommen dadurch meist ohne neuen Python-Code dazu.
+- Pro Sprache ein **Extractor in Python**, der den tree-sitter-Baum durchläuft (`src/wingman/extract/<lang>.py`).
+  > *Umgesetzt in Phase 1:* Ursprünglich waren `.scm`-Query-Dateien geplant, ähnlich den `tags.scm` von GitHub/nvim. Für qualifizierte Namen, Verschachtelung, Doku-Kommentare und die Typinferenz von Empfängern (`_calc.Breakdown()` → `ITaxCalculator`) braucht es aber Kontext über mehrere Knoten. Mit einem Visitor geht das deutlich einfacher. Neue Sprachen kosten damit etwas Python-Code, je nach Sprache ca. 400–500 Zeilen.
 - **Sprachpriorität:**
   1. **TypeScript** (inkl. TSX) und **C#**: Prototyp
   2. **JavaScript** (inkl. JSX): fällt fast gratis mit TS ab, gleiche Grammatik-Familie
@@ -109,10 +110,13 @@ Das ist der schwierigste Teil. Deshalb mehrstufig, und jede Kante bekommt eine *
 1. **Lokal**: Name im selben Scope oder in derselben Datei definiert → `1.0`
 2. **Import-basiert**: Über die Import-Tabelle der Datei auf ein Symbol in einem anderen Modul → `0.9`
 3. **Typ-Heuristik**: `self.foo()` / `this.foo()` → Methode der eigenen Klasse oder einer Basisklasse → `0.8`
-4. **Name-Match global**: Eindeutiger Name im Repo → `0.5`. Mehrdeutig → mehrere Kanten mit geteilter Konfidenz.
+   - *Umgesetzt:* Der Extractor merkt sich die deklarierten Typen von Feldern, Properties, Parametern und lokalen Variablen. Bei `_calc.Breakdown()` wird so `ITaxCalculator.Breakdown` gefunden (`0.85`).
+   - Ketten wie `_repository.UnitOfWork.SaveEntitiesAsync()` werden Glied für Glied über den deklarierten Werttyp der Member (`symbols.type_name`, `Task<T>`/`Promise<T>` ausgepackt) verfolgt (`0.8`). Bei C# funktioniert das auch mit implizitem `this`.
+   - Implementierungen erben die Aufrufe ihrer Interface-/Basismethode über `overrides`-Kanten. `wingman callers` zeigt sie mit „via …“ an.
+4. **Name-Match global**: Eindeutiger Name im Repo → `0.5`. Mehrdeutige Namen bleiben vorerst unaufgelöst. Bekannte Laufzeit-Globals (`console`, `Math` …) und externe Typen werden nie auf Repo-Symbole gemappt.
 5. **Optional präzise**: Ein Adapter nutzt LSP-Server (pyright, tsserver, OmniSharp) oder **SCIP**-Indizes (`scip-python`, `scip-typescript` …), wenn sie vorhanden sind. Diese Kanten bekommen `1.0` und ersetzen die heuristischen.
 
-Nicht auflösbare Referenzen (z. B. auf externe Libraries) bleiben als `unresolved_name` erhalten. Sie helfen trotzdem bei der Suche, etwa „wo wird `requests.post` aufgerufen?“.
+Jede Referenz speichert den Namen, wie er im Code steht (`target_name`), sowie den Empfänger (`qualifier`, `qualifier_type`). Der Resolver läuft nach jedem Index-Lauf über das ganze Repo, weil sich die Symbol-IDs geänderter Dateien ändern und Referenzen *in* diese Dateien neu aufgelöst werden müssen. Das sind reine Dictionary-Lookups im Speicher, ca. 1–2 s für 80k Referenzen. Nicht auflösbare Referenzen (z. B. auf externe Libraries) bleiben mit `target_name` erhalten. Sie helfen trotzdem bei der Suche, etwa „wo wird `requests.post` aufgerufen?“.
 
 ### 3.5 Enricher – Beschreibungen
 
@@ -160,7 +164,7 @@ workspaces   1─n repositories
 repositories 1─n index_runs
 repositories 1─n files 1─n symbols ─┐ (parent_id: Verschachtelung)
                       │             │
-                      └─1─n refs n──┘ (from_symbol → to_symbol, + unresolved_name)
+                      └─1─n refs n──┘ (from_symbol → to_symbol, + target_name)
 files 1─n imports
 symbols n─n symbols   via symbol_edges (inherits, implements, overrides)
 documents 1─n doc_chunks n─n (symbols|files) via doc_links
@@ -213,6 +217,7 @@ CREATE TABLE symbols (
   name            TEXT NOT NULL,
   qualified_name  TEXT NOT NULL,     -- pkg.module.Class.method
   signature       TEXT,
+  type_name       TEXT,              -- deklarierter Werttyp (Feld/Property-Typ, Rückgabetyp ohne Task<>/Promise<>)
   visibility      TEXT,              -- public|private|protected|internal
   modifiers       TEXT,              -- JSON: ["static","async"]
   decorators      TEXT,              -- JSON: ["@app.route('/x')"]
@@ -233,9 +238,11 @@ CREATE TABLE refs (
   id              INTEGER PRIMARY KEY,
   from_symbol_id  INTEGER REFERENCES symbols(id) ON DELETE CASCADE, -- NULL = Top-Level der Datei
   from_file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-  to_symbol_id    INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
-  unresolved_name TEXT,              -- falls nicht auflösbar (z. B. externe Lib)
-  kind            TEXT NOT NULL,     -- call|instantiate|type_ref|read|write|import|http_call
+  to_symbol_id    INTEGER REFERENCES symbols(id) ON DELETE SET NULL,  -- NULL = nicht aufgelöst
+  target_name     TEXT NOT NULL,     -- Name wie im Code (bleibt auch ohne Auflösung durchsuchbar)
+  qualifier       TEXT,              -- Empfänger wie im Code: this, base, _calc, ns, _repo.UnitOfWork
+  qualifier_type  TEXT,              -- deklarierter Typ des ersten Kettenglieds, falls bekannt
+  kind            TEXT NOT NULL,     -- call|instantiate|type_ref|inherits|implements|http_call
   line INTEGER, col INTEGER,
   confidence      REAL NOT NULL DEFAULT 1.0,
   resolver        TEXT               -- local|import|heuristic|name|scip|lsp
@@ -452,7 +459,7 @@ Einbindung: `claude mcp add wingman -- wingman serve --mcp`.
 
 ---
 
-## 7. Projektstruktur (geplant)
+## 7. Projektstruktur (Stand Phase 1, später geplante Module eingerückt markiert)
 
 ```
 agent-wingman/
@@ -462,22 +469,22 @@ agent-wingman/
 ├── src/wingman/
 │   ├── cli.py
 │   ├── config.py               # .wingman/config.toml + Env
-│   ├── scanner.py
-│   ├── parsing/
-│   │   ├── treesitter.py
-│   │   └── queries/<lang>/{symbols,refs}.scm
-│   ├── extract/                # Symbol-, Ref-, Import-Extraktion
-│   ├── resolve/                # Resolver-Stufen, SCIP/LSP-Adapter
-│   ├── enrich/                 # LLM-Summaries, Provider-Interface
-│   ├── embed/                  # Embedding-Provider
-│   ├── docs/                   # PDF/URL/MD-Ingest, Chunker, Linker
+│   ├── scanner.py              # git ls-files / Walk, Ignore-Regeln, Test-/Generated-Erkennung
+│   ├── extract/                # tree-sitter-Visitor je Sprache: typescript.py, csharp.py
+│   ├── indexer.py              # inkrementell: Hash-Vergleich, Speichern, FTS
+│   ├── resolver.py             # Imports, Typen, Aufrufe, Vererbung, overrides-Kanten
+│   ├── query.py                # search, symbol, callers, callees, outline
+│   ├── (später) enrich/        # LLM-Summaries, Provider-Interface
+│   ├── (später) embed/         # Embedding-Provider
+│   ├── (später) docs/          # PDF/URL/MD-Ingest, Chunker, Linker
 │   ├── storage/
 │   │   ├── schema.py           # SQLAlchemy Core Tabellen
 │   │   ├── migrations/         # Alembic
-│   │   ├── sqlite_backend.py
-│   │   └── postgres_backend.py
-│   ├── query/                  # Hybrid-Suche, RRF, Graph-Expansion, Context Pack
-│   └── mcp_server.py
+│   │   ├── store.py            # Workspaces & Repositories
+│   │   └── search.py           # SearchBackend: SQLite FTS5, LIKE-Fallback (später tsvector/pgvector)
+│   ├── (später) resolve/scip   # SCIP/LSP-Adapter
+│   ├── (später) context.py     # Hybrid-Suche, RRF, Graph-Expansion, Context Pack
+│   └── (später) mcp_server.py
 └── tests/
     └── fixtures/               # Mini-Repos je Sprache mit erwarteten Indizes
 ```
@@ -492,8 +499,8 @@ Der Prototyp ist auf **einen Entwickler mit lokaler SQLite-DB** ausgelegt. Das D
 
 | Phase | Inhalt | Ergebnis |
 |------|--------|----------|
-| **0 – Skeleton** | `pyproject`, CLI-Gerüst, Config, SQLite-Schema + Alembic, Workspace/Repo-Verwaltung | `wingman init`, `wingman repo add` laufen |
-| **1 – Strukturindex** | Scanner, tree-sitter für **TypeScript + C#**, Symbole, Imports, Refs, lokaler/Import-Resolver (inkl. `tsconfig`-Pfade, C#-Namespaces), FTS5 | `wingman symbol`, `callers`, `outline`, `search` (nur FTS) |
+| **0 – Skeleton** ✅ | `pyproject`, CLI-Gerüst, Config, SQLite-Schema + Alembic, Workspace/Repo-Verwaltung | `wingman init`, `wingman repo add` laufen |
+| **1 – Strukturindex** ✅ | Scanner, tree-sitter für **TypeScript + C#**, Symbole, Imports, Refs, lokaler/Import-Resolver (inkl. `tsconfig`-Pfade, C#-Namespaces), FTS5 | `wingman index`, `search`, `symbol`, `callers`, `callees`, `outline` |
 | **2 – MCP** | MCP-Server mit Kern-Tools, Context Pack, inkrementelles Indexing, Hooks | In Claude Code nutzbar |
 | **3 – Multi-Repo** | Paket-Abhängigkeiten zwischen Repos, HTTP-Endpunkt-Matching (ASP.NET ↔ fetch/axios) | Agent folgt Aufrufen vom Frontend ins Backend |
 | **4 – Semantik** | Embeddings (lokal), sqlite-vec, Hybrid-Suche + RRF + Graph-Expansion | Bug-Report → relevante Stellen |
@@ -512,6 +519,16 @@ Die gute Nachricht: Git-Historien liefern Ground Truth gratis. Für jeden Bugfix
 - **Recall@k** (Datei- und Symbolebene), **MRR**
 - **Token-Effizienz**: Wie viele Tokens braucht der Agent bis zur ersten richtigen Datei, mit und ohne wingman?
 - Indexing-Dauer und DB-Größe pro 100k LOC
+
+**Erste Messung (Phase 1, ohne Embeddings und LLM-Summaries):**
+
+| Repo | Dateien | Symbole + Referenzen | Erstindex | Re-Index ohne Änderung |
+|------|---------|----------------------|-----------|------------------------|
+| jasontaylordev/CleanArchitecture (C#/TS) | 134 | 2.145 Refs | 0,6 s | < 0,2 s |
+| dotnet/eShop (C#) | 553 | 16k Refs | 2,5 s | 0,2 s |
+| nestjs/nest (TS) | 2.157 | 83k Refs | 12 s | 1,5 s |
+
+Zusammen sind das 28 MB SQLite. Eine Suche dauert unter 1 s. Vererbung, Typreferenzen und Instanziierungen werden aufgelöst, soweit das Ziel im Repo liegt. Der größte Teil der unaufgelösten Referenzen sind Aufrufe in Framework- und Bibliothekscode (BCL, ASP.NET, npm). Das ist erwartet und wird mit Multi-Repo/Paketauflösung (Phase 3) und optionalen SCIP-Indizes kleiner.
 
 ---
 
@@ -587,5 +604,5 @@ Offene Punkte zum Weiterdiskutieren:
 | 1 | Embedding-Modell | **Lokal als Default** (`sentence-transformers`, code-fähiges Modell), API-Provider optional per Config |
 | 2 | LLM-Summaries | **Anthropic als Default**, kleines und günstiges Modell, **Opt-in** per Config, mit Budget-Limit. Andere Provider (OpenAI-kompatibel, Ollama) über das Provider-Interface |
 | 3 | Multi-Repo | **Ja, von Anfang an**: Workspaces mit mehreren Repos in einer DB, Kanten über Repo-Grenzen (Pakete, HTTP-Endpunkte), siehe 4.3 |
-| 4 | Sprachen | **TypeScript + C#** im Prototyp, danach **JavaScript**, dann **Java, Python, PHP**, danach **C und C++**. Weitere Sprachen (Go, Rust, Kotlin …) bleiben über tree-sitter-Queries jederzeit nachrüstbar |
+| 4 | Sprachen | **TypeScript + C#** im Prototyp, danach **JavaScript**, dann **Java, Python, PHP**, danach **C und C++**. Weitere Sprachen (Go, Rust, Kotlin …) bleiben über weitere tree-sitter-Extractors jederzeit nachrüstbar |
 | 5 | Teilen | **Prototyp: ein Dev, lokale SQLite.** Datenmodell wird teilbar ausgelegt (inhaltsadressiert, `stable_key`). Teamlösung siehe Brainstorming in Abschnitt 10, Entscheidung später |

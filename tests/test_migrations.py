@@ -34,7 +34,12 @@ def test_migrations_match_schema(tmp_path):
     db.upgrade(engine)
     with engine.connect() as conn:
         context = MigrationContext.configure(
-            conn, opts={"compare_type": True, "version_table": db.VERSION_TABLE}
+            conn,
+            opts={
+                "compare_type": True,
+                "version_table": db.VERSION_TABLE,
+                "include_object": db.include_object,
+            },
         )
         diff = compare_metadata(context, metadata)
     assert diff == []

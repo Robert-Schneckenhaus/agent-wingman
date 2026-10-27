@@ -12,7 +12,7 @@ import os
 from alembic import context
 from sqlalchemy import create_engine
 
-from wingman.storage.db import VERSION_TABLE
+from wingman.storage.db import VERSION_TABLE, include_object
 from wingman.storage.schema import metadata
 
 config = context.config
@@ -23,6 +23,7 @@ def _configure(connection) -> None:
         connection=connection,
         target_metadata=metadata,
         version_table=VERSION_TABLE,
+        include_object=include_object,
         render_as_batch=connection.dialect.name == "sqlite",
         compare_type=True,
     )

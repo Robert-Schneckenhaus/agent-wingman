@@ -15,6 +15,12 @@ MIGRATIONS_LOCATION = "wingman.storage:migrations"
 VERSION_TABLE = "wingman_alembic_version"
 
 
+def include_object(obj, name, type_, reflected, compare_to) -> bool:
+    """Alembic filter: ignore tables that exist in the database but not in the schema
+    (backend-specific search tables such as ``symbols_fts`` and their shadow tables)."""
+    return not (type_ == "table" and reflected and compare_to is None)
+
+
 def is_sqlite(url: str) -> bool:
     return make_url(url).get_backend_name() == "sqlite"
 
