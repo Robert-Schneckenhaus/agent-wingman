@@ -148,7 +148,7 @@ class FastEmbedEmbedder:
         return self._impl
 
     def embed_documents(self, texts: Sequence[str]) -> np.ndarray:
-        return _normalize(np.array(list(self._model().embed(list(texts), batch_size=32))))
+        return _normalize(np.array(list(self._model().embed(list(texts), batch_size=16))))
 
     def embed_query(self, text: str) -> np.ndarray:
         return _normalize(np.array(list(self._model().query_embed([text]))))[0]
@@ -290,7 +290,8 @@ def ensure_embeddings(
                 stats.skipped += 1
 
     stats.pending = len(texts)
-    todo = list(texts.items())
+    # similar lengths per batch: padding to the longest text dominates the cost (~3x)
+    todo = sorted(texts.items(), key=lambda item: len(item[1]))
     if max_texts is not None:
         todo = todo[:max_texts]
     for start in range(0, len(todo), batch_size):
