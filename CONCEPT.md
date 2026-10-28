@@ -558,12 +558,17 @@ Der Prototyp ist auf **einen Entwickler mit lokaler SQLite-DB** ausgelegt. Das D
 | **1 – Strukturindex** ✅ | Scanner, tree-sitter für **TypeScript + C#**, Symbole, Imports, Refs, lokaler/Import-Resolver (inkl. `tsconfig`-Pfade, C#-Namespaces), FTS5 | `wingman index`, `search`, `symbol`, `callers`, `callees`, `outline` |
 | **2 – MCP** ✅ | MCP-Server mit Kern-Tools, Context Pack, inkrementelles Indexing, Hooks | In Claude Code nutzbar |
 | **3 – Multi-Repo** ✅ | Paket-Abhängigkeiten zwischen Repos, HTTP-Endpunkt-Matching (ASP.NET ↔ fetch/axios) | Agent folgt Aufrufen vom Frontend ins Backend |
-| **4 – Semantik** ✅ (vorgezogen) | Embeddings (lokal, fastembed), inhaltsadressierter Vektor-Cache, Hybrid-Suche (gewichtete Fusion statt RRF) + Graph-Expansion. Noch offen: Qualitätsmessung mit echtem Modell, `sqlite-vec` erst bei Bedarf | Bug-Report → relevante Stellen |
+| **4 – Semantik** ✅ (vorgezogen) | Embeddings (lokal, fastembed), inhaltsadressierter Vektor-Cache, Hybrid-Suche (gewichtete Fusion statt RRF) + Graph-Expansion. Gemessen mit echtem Modell (Abschnitt 9); `sqlite-vec` erst bei Bedarf | Bug-Report → relevante Stellen |
 | **5 – Summaries** | LLM-Enricher bottom-up (Anthropic, kleines Modell, Opt-in), Cache, Budget, Datei-/Modul-Summaries | Undokumentierter Code wird durchsuchbar |
 | **6 – Externe Doku** | PDF/URL/MD/OpenAPI-Ingest, Chunking, Auto-Linking | Spezifikationen hängen am Code |
 | **7 – Breite** | JavaScript, dann Java, Python, PHP, dann **C/C++** (inkl. `compile_commands.json`, Header/Source-Zuordnung); SCIP/Roslyn/clang-Adapter; Notes | Alle Zielsprachen abgedeckt |
 | **8 – Teilen** | Export/Import-Format, CI-Build, PostgreSQL-Backend (siehe Abschnitt 10) | Team nutzt einen gemeinsamen Index |
 | **9 – Evaluation** | Benchmark: echte Issues/Commits, Recall@k der geänderten Dateien (läuft ab Phase 2 mit, wird hier ausgebaut) | Messbare Qualität, Tuning |
+
+### Todo – für später vorgemerkt
+
+- [ ] **Mehrsprachige Bug-Reports:** Das Standardmodell `bge-small-en-v1.5` findet deutsche Anfragen praktisch nicht (Messung in Abschnitt 9). Idee: ein zweites, mehrsprachiges Modell (z. B. `paraphrase-multilingual-MiniLM-L12-v2`) parallel einbetten und nur für nicht-englische Anfragen nutzen. Der Vektor-Cache ist schon nach Modell getrennt. Kosten: doppelte Einbettzeit. Erst angehen, wenn nicht-englische Reports gebraucht werden.
+- [ ] **Rauschen bei Stacktraces:** Semantische Treffer aus Repos, die in keinem Frame vorkommen (z. B. `InvalidDecoratorItemException` aus nest bei einem eShop-Stacktrace), könnten abgewertet werden.
 
 ---
 
