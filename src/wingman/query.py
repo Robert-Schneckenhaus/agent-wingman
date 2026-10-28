@@ -438,9 +438,12 @@ class SymbolDetails:
     """Base members this member overrides or implements."""
     overridden_by: list[SymbolHit]
     caller_count: int
+    generated_summary: str | None = None
+    """LLM-written description (``wingman summarize``) for code without a doc comment."""
 
     def to_dict(self) -> dict:
-        data = {k: getattr(self, k) for k in ("doc", "visibility", "modifiers", "decorators")}
+        keys = ("doc", "generated_summary", "visibility", "modifiers", "decorators")
+        data = {k: getattr(self, k) for k in keys}
         data["symbol"] = self.symbol.to_dict()
         for key in ("members", "bases", "derived", "overrides", "overridden_by"):
             data[key] = [s.to_dict() for s in getattr(self, key)]
@@ -458,7 +461,12 @@ def symbol_details(conn: Connection, symbol_id: int) -> SymbolDetails:
     hit = get_symbols(conn, [symbol_id])[symbol_id]
     row = conn.execute(
         select(
-            symbols.c.doc, symbols.c.visibility, symbols.c.modifiers, symbols.c.decorators
+            symbols.c.doc,
+            symbols.c.summary,
+            symbols.c.summary_source,
+            symbols.c.visibility,
+            symbols.c.modifiers,
+            symbols.c.decorators,
         ).where(symbols.c.id == symbol_id)
     ).one()
     members = [
@@ -494,6 +502,7 @@ def symbol_details(conn: Connection, symbol_id: int) -> SymbolDetails:
         overrides=list(get_symbols(conn, _overridden(conn, symbol_id)).values()),
         overridden_by=list(get_symbols(conn, _overriding(conn, symbol_id)).values()),
         caller_count=caller_count,
+        generated_summary=row.summary if row.summary_source == "generated" else None,
     )
 
 

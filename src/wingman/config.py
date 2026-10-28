@@ -40,6 +40,20 @@ class EmbeddingConfig:
     """Where models are downloaded to (default: ~/.cache/wingman/models)."""
 
 
+DEFAULT_SUMMARY_MODEL = "claude-haiku-5-5"
+
+
+@dataclass(frozen=True)
+class SummaryConfig:
+    enabled: bool = False
+    """LLM summaries cost money, so they are opt-in."""
+    model: str = DEFAULT_SUMMARY_MODEL
+    max_tokens_per_run: int = 1_000_000
+    """Budget: input + output tokens one ``wingman summarize`` run may spend."""
+    min_lines: int = 3
+    """Functions and methods shorter than this are not summarized."""
+
+
 @dataclass(frozen=True)
 class Config:
     home: Path
@@ -47,6 +61,7 @@ class Config:
     workspace: str
     db_url: str
     embeddings: EmbeddingConfig = EmbeddingConfig()
+    summaries: SummaryConfig = SummaryConfig()
 
     @property
     def root(self) -> Path:
@@ -106,7 +121,23 @@ def load_config(home: Path | None = None) -> Config:
         workspace=workspace,
         db_url=db_url,
         embeddings=_embedding_config(data.get("embeddings", {}), config_path),
+        summaries=_summary_config(data.get("summaries", {}), config_path),
     )
+
+
+def _summary_config(section: dict, config_path: Path) -> SummaryConfig:
+    enabled = section.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError(f"{config_path}: summaries.enabled must be true or false")
+    try:
+        return SummaryConfig(
+            enabled=enabled,
+            model=str(section.get("model", DEFAULT_SUMMARY_MODEL)),
+            max_tokens_per_run=int(section.get("max_tokens_per_run", 1_000_000)),
+            min_lines=int(section.get("min_lines", 3)),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{config_path}: invalid [summaries] value: {exc}") from exc
 
 
 def _embedding_config(section: dict, config_path: Path) -> EmbeddingConfig:
@@ -146,4 +177,13 @@ name = "{workspace}"
 # enabled = "auto"
 # model = "{DEFAULT_EMBEDDING_MODEL}"
 # cache_dir = "~/.cache/wingman/models"
+
+[summaries]
+# Short descriptions of undocumented code, written by an LLM with `wingman summarize`
+# (pip install 'agent-wingman[summaries]', needs ANTHROPIC_API_KEY). Costs money: opt-in.
+# Summaries are cached by code hash, so unchanged code is never summarized twice.
+# enabled = false
+# model = "{DEFAULT_SUMMARY_MODEL}"
+# max_tokens_per_run = 1000000
+# min_lines = 3
 """

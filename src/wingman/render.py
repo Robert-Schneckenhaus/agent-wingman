@@ -51,6 +51,8 @@ def details(
         lines += [f"  {decorator}" for decorator in d.decorators]
         if d.doc:
             lines.append("  doc: " + d.doc.replace("\n", "\n       "))
+        elif d.generated_summary:
+            lines.append(f"  summary (generated): {d.generated_summary}")
         for note in (notes or {}).get(s.id, []):
             author = f" ({note.author})" if note.author else ""
             lines.append(f"  note{author}: {note.text}")

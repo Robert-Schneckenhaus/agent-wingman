@@ -8,7 +8,7 @@ from pathlib import Path
 
 from sqlalchemy import Connection, Engine
 
-from wingman import embeddings
+from wingman import embeddings, summaries
 from wingman.config import Config, ConfigError, load_config
 from wingman.storage import db, store
 
@@ -30,6 +30,7 @@ class Workspace:
         self._engine: Engine | None = None
         self._embedder: embeddings.Embedder | None = None
         self._embedder_checked = False
+        self._summarizer: summaries.Summarizer | None = None
         self.warnings: list[str] = []
         """Non-fatal problems (e.g. semantic search unavailable), for the caller to show."""
 
@@ -100,6 +101,25 @@ class Workspace:
         """Forget a previous failure and load the embedder again on next use."""
         self._failure_file().unlink(missing_ok=True)
         self._embedder, self._embedder_checked = None, False
+
+    @property
+    def summarizer(self) -> summaries.Summarizer:
+        """The LLM client for ``wingman summarize``; raises SummaryError if unusable."""
+        if self._summarizer is None:
+            self._summarizer = summaries.AnthropicSummarizer(self.config.summaries.model)
+        return self._summarizer
+
+    def set_summarizer(self, summarizer: summaries.Summarizer) -> None:
+        """Use a specific summarizer (tests, other providers)."""
+        self._summarizer = summarizer
+
+    def restore_summaries(self) -> int:
+        """Re-attach cached LLM summaries to re-indexed symbols (free, no API call)."""
+        if not self.config.summaries.enabled:
+            return 0
+        with self.engine.connect() as conn:
+            workspace_id = self.workspace_id(conn)
+        return summaries.apply_cached(self.engine, workspace_id, self.config.summaries)
 
     def set_embedder(self, embedder: embeddings.Embedder | None) -> None:
         """Use a specific embedder (tests, other providers)."""

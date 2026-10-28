@@ -9,8 +9,9 @@ The full design is in [CONCEPT.md](CONCEPT.md) (German).
 
 > **Status:** structural index for **TypeScript/TSX and C#** (symbols, docs, imports,
 > call graph, inheritance), full-text + semantic search, context packs for bug reports,
-> multi-repo linking (packages, HTTP endpoints), an MCP server and hooks for Claude
-> Code. LLM summaries and external docs follow (see the roadmap in CONCEPT.md).
+> multi-repo linking (packages, HTTP endpoints), LLM descriptions for undocumented code,
+> an MCP server and hooks for Claude Code. External docs follow (see the roadmap in
+> CONCEPT.md).
 
 ## Installation
 
@@ -20,6 +21,7 @@ Requires Python 3.11+.
 pip install -e ".[dev]"          # from a checkout
 pip install -e ".[postgres]"     # optional PostgreSQL driver
 pip install -e ".[embeddings]"   # optional semantic search (local model via fastembed)
+pip install -e ".[summaries]"    # optional LLM descriptions (Anthropic SDK)
 ```
 
 ## Usage
@@ -111,6 +113,31 @@ multilingual model such as `sentence-transformers/paraphrase-multilingual-MiniLM
 
 `--no-semantic` on `search`/`context` uses full-text search only. Without the model
 (offline, blocked download) everything keeps working with full-text search and a warning.
+
+### Descriptions for undocumented code (LLM, opt-in)
+
+`wingman summarize` asks Claude (`claude-haiku-5-5` by default) for a one- or
+two-sentence description and a few search keywords for every class, function and
+method without a doc comment. These descriptions make undocumented code findable by
+what it does: they go into full-text search, semantic search and context packs.
+
+```toml
+[summaries]
+enabled = true                # opt-in: this sends code to the Anthropic API and costs tokens
+model = "claude-haiku-5-5"
+max_tokens_per_run = 1000000  # budget per run (input + output)
+min_lines = 3                 # skip shorter functions and methods
+```
+
+```bash
+pip install -e ".[summaries]"             # Anthropic SDK; uses ANTHROPIC_API_KEY
+wingman summarize --dry-run               # count candidates, estimate tokens, send nothing
+wingman summarize backend --limit 200     # one repository, at most 200 symbols
+```
+
+Called code is described before its callers, so prompts can include what a function
+calls. Results are cached by code hash: unchanged code is never sent twice, and
+re-indexed symbols get their description back for free.
 
 Every query command accepts `--json` for machine-readable output. Symbol names can
 be simple names, qualified-name suffixes (`Class.member`) or full qualified names.

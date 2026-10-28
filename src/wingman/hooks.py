@@ -42,6 +42,8 @@ def post_edit(ws: Workspace, payload: dict) -> str:
         stats = index_repository(ws.engine, repo, paths=[rel])
         if stats.files_indexed or stats.files_removed:
             messages.append(f"wingman: re-indexed {repo.name}:{rel} ({stats.seconds}s)")
+    if messages:
+        ws.restore_summaries()
     return "\n".join(messages)
 
 
@@ -54,6 +56,8 @@ def session_start(ws: Workspace) -> str:
         except Exception:  # a missing repository must not block the others
             continue
         changed += stats.files_indexed + stats.files_removed
+    if changed:
+        ws.restore_summaries()
     embedder = ws.embedder
     with ws.engine.connect() as conn:
         workspace_id = ws.workspace_id(conn)

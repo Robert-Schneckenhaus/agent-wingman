@@ -90,6 +90,11 @@ def embedding_text(
     return "\n".join(parts)[:MAX_TEXT_CHARS]
 
 
+def embedding_doc(doc: str | None, summary: str | None, summary_source: str | None) -> str | None:
+    """The doc comment, or else a generated summary (``wingman summarize``)."""
+    return doc or (summary if summary_source == "generated" else None)
+
+
 def text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
 
@@ -196,6 +201,8 @@ def _missing(conn: Connection, workspace_id: int, model: str):
             symbols.c.qualified_name,
             symbols.c.signature,
             symbols.c.doc,
+            symbols.c.summary,
+            symbols.c.summary_source,
             symbols.c.start_byte,
             symbols.c.end_byte,
             symbols.c.embed_hash,
@@ -215,7 +222,7 @@ def _missing(conn: Connection, workspace_id: int, model: str):
     ).all()
 
 
-def _member_names(conn: Connection, parent_ids: list[int]) -> dict[int, list[str]]:
+def member_names(conn: Connection, parent_ids: list[int]) -> dict[int, list[str]]:
     members: dict[int, list[str]] = defaultdict(list)
     for start in range(0, len(parent_ids), 500):
         rows = conn.execute(
@@ -256,7 +263,7 @@ def ensure_embeddings(
     with engine.connect() as conn:
         rows = _missing(conn, workspace_id, embedder.model)
         type_ids = [r.id for r in rows if r.kind in TYPE_KINDS]
-        members = _member_names(conn, type_ids) if type_ids else {}
+        members = member_names(conn, type_ids) if type_ids else {}
 
     texts: dict[str, str] = {}
     by_file: dict[int, list] = defaultdict(list)
@@ -279,7 +286,7 @@ def ensure_embeddings(
                 kind=row.kind,
                 qualified_name=row.qualified_name,
                 signature=row.signature,
-                doc=row.doc,
+                doc=embedding_doc(row.doc, row.summary, row.summary_source),
                 path=row.path,
                 body=body_text(data, row.start_byte, row.end_byte),
                 members=members.get(row.id, ()),

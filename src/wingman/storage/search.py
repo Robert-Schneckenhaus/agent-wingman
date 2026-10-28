@@ -69,6 +69,10 @@ class SearchBackend(Protocol):
 
     def delete_for_files(self, conn: Connection, file_ids: Iterable[int]) -> None: ...
 
+    def replace(self, conn: Connection, rows: Sequence[FtsRow]) -> None:
+        """Re-index existing symbols (e.g. after a summary was added)."""
+        ...
+
     def purge_orphans(self, conn: Connection) -> None: ...
 
     def search(self, conn: Connection, query: str, limit: int) -> list[tuple[int, float]]:
@@ -99,6 +103,17 @@ class SqliteFtsBackend:
                 for r in rows
             ],
         )
+
+    def replace(self, conn: Connection, rows: Sequence[FtsRow]) -> None:
+        if not rows:
+            return
+        conn.execute(
+            text("DELETE FROM symbols_fts WHERE rowid IN :ids").bindparams(
+                bindparam("ids", expanding=True)
+            ),
+            {"ids": [r.symbol_id for r in rows]},
+        )
+        self.index(conn, rows)
 
     def delete_for_files(self, conn: Connection, file_ids: Iterable[int]) -> None:
         ids = list(file_ids)
@@ -132,12 +147,15 @@ class SqliteFtsBackend:
 
 
 class LikeBackend:
-    """Portable fallback: counts matching terms in name, qualified name and doc."""
+    """Portable fallback: counts matching terms in name, qualified name, doc and summary."""
 
     def index(self, conn: Connection, rows: Sequence[FtsRow]) -> None:
         pass
 
     def delete_for_files(self, conn: Connection, file_ids: Iterable[int]) -> None:
+        pass
+
+    def replace(self, conn: Connection, rows: Sequence[FtsRow]) -> None:
         pass
 
     def purge_orphans(self, conn: Connection) -> None:
@@ -154,16 +172,23 @@ class LikeBackend:
                 or_(
                     func.lower(symbols.c.qualified_name).like(pattern),
                     func.lower(symbols.c.doc).like(pattern),
+                    func.lower(symbols.c.summary).like(pattern),
                 )
             )
         rows = conn.execute(
-            select(symbols.c.id, symbols.c.name, symbols.c.qualified_name, symbols.c.doc)
+            select(
+                symbols.c.id,
+                symbols.c.name,
+                symbols.c.qualified_name,
+                symbols.c.doc,
+                symbols.c.summary,
+            )
             .where(or_(*conditions))
             .limit(limit * 5)
         )
         scored = []
         for row in rows:
-            haystack = f"{row.qualified_name} {row.doc or ''}".lower()
+            haystack = f"{row.qualified_name} {row.doc or row.summary or ''}".lower()
             score = sum(3.0 if t in row.name.lower() else 1.0 for t in terms if t in haystack)
             scored.append((row.id, score))
         scored.sort(key=lambda item: -item[1])

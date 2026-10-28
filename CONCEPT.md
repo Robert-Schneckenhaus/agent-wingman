@@ -129,6 +129,17 @@ Jede Referenz speichert den Namen, wie er im Code steht (`target_name`), sowie d
 - **Steuerbar**: `--no-llm`, Budget-Limit (max. Tokens oder Kosten pro Lauf), Filter (z. B. nur public Symbole, nur ab N Zeilen).
 - **Provider-agnostisch**: Anthropic API als Default, OpenAI-kompatibel oder lokal (Ollama) über ein schmales Interface.
 
+> *Umgesetzt (Phase 5):* `src/wingman/summaries.py`, Befehl `wingman summarize`.
+> - **Opt-in:** `[summaries] enabled = true` in der Config, sonst verweigert `wingman summarize` den Lauf. `--dry-run` zählt Kandidaten und schätzt die Tokens, ohne etwas zu senden.
+> - **Modell:** `claude-haiku-5-5` über das offizielle Anthropic-SDK (`pip install 'agent-wingman[summaries]'`), `effort: low`, strukturierte Ausgabe per JSON-Schema. Zugangsdaten wie beim SDK üblich (`ANTHROPIC_API_KEY` u. a.).
+> - **Kandidaten:** Klassen, Interfaces, Structs, Records, Funktionen, Methoden und Komponenten ohne Doku-Kommentar. Test- und generierte Dateien werden ausgelassen, Funktionen und Methoden erst ab `min_lines` (Standard 3) Zeilen.
+> - **Bottom-up:** Reihenfolge nach Aufruf- und Member-Graph (Tarjan für Zyklen). Ein Prompt enthält die bekannten Beschreibungen der aufgerufenen Symbole, eine Klasse die ihrer Member. Bis zu 8 Symbole pro Anfrage, 4 Anfragen parallel.
+> - **Budget:** `max_tokens_per_run` (Standard 1 Mio. Input- plus Output-Tokens) oder `--max-tokens`; `--limit` begrenzt die Zahl der Symbole. Ein abgebrochener Lauf setzt beim nächsten Mal dort fort.
+> - **Cache:** `summary_cache` mit Schlüssel `sha256(prompt_version + model + body_hash)`. Nach einer Re-Indexierung holen `wingman index`, `reindex` und die Hooks die Beschreibungen kostenlos aus dem Cache zurück.
+> - **Wirkung:** Die Beschreibung landet in `symbols.summary` (`summary_source = 'generated'`), samt Stichworten im Volltextindex und als Doku-Teil im Embedding-Text. `wingman symbol` zeigt sie als „summary (generated)“, Context Packs zeigen sie unter dem Symbol.
+> - **Geschätzte Kosten** (Dry-Run auf CleanArchitecture + eShop + nest): 4.881 Symbole, ca. 1,5 Mio. Tokens in 627 Anfragen. Mit Haiku 5.5 (0,10 $ / 0,50 $ pro Mio. Input/Output) sind das grob 0,30 $. Noch nicht mit der echten API gemessen, weil in der Entwicklungsumgebung kein API-Key vorhanden ist.
+> - **Noch offen** (siehe Todo in Abschnitt 8): Datei- und Modul-Summaries, Batches-API (50 % günstiger), weitere Provider.
+
 ### 3.6 Embeddings
 
 - Embeddings für Symbole (Name + Signatur + Doku/Summary + gekürzter Body), Datei-Summaries und Doku-Chunks.
@@ -559,7 +570,7 @@ Der Prototyp ist auf **einen Entwickler mit lokaler SQLite-DB** ausgelegt. Das D
 | **2 – MCP** ✅ | MCP-Server mit Kern-Tools, Context Pack, inkrementelles Indexing, Hooks | In Claude Code nutzbar |
 | **3 – Multi-Repo** ✅ | Paket-Abhängigkeiten zwischen Repos, HTTP-Endpunkt-Matching (ASP.NET ↔ fetch/axios) | Agent folgt Aufrufen vom Frontend ins Backend |
 | **4 – Semantik** ✅ (vorgezogen) | Embeddings (lokal, fastembed), inhaltsadressierter Vektor-Cache, Hybrid-Suche (gewichtete Fusion statt RRF) + Graph-Expansion. Gemessen mit echtem Modell (Abschnitt 9); `sqlite-vec` erst bei Bedarf | Bug-Report → relevante Stellen |
-| **5 – Summaries** | LLM-Enricher bottom-up (Anthropic, kleines Modell, Opt-in), Cache, Budget, Datei-/Modul-Summaries | Undokumentierter Code wird durchsuchbar |
+| **5 – Summaries** ✅ (ohne echten API-Lauf) | LLM-Enricher bottom-up (Anthropic, kleines Modell, Opt-in), Cache, Budget, Datei-/Modul-Summaries | Undokumentierter Code wird durchsuchbar |
 | **6 – Externe Doku** | PDF/URL/MD/OpenAPI-Ingest, Chunking, Auto-Linking | Spezifikationen hängen am Code |
 | **7 – Breite** | JavaScript, dann Java, Python, PHP, dann **C/C++** (inkl. `compile_commands.json`, Header/Source-Zuordnung); SCIP/Roslyn/clang-Adapter; Notes | Alle Zielsprachen abgedeckt |
 | **8 – Teilen** | Export/Import-Format, CI-Build, PostgreSQL-Backend (siehe Abschnitt 10) | Team nutzt einen gemeinsamen Index |
@@ -569,6 +580,9 @@ Der Prototyp ist auf **einen Entwickler mit lokaler SQLite-DB** ausgelegt. Das D
 
 - [ ] **Mehrsprachige Bug-Reports:** Das Standardmodell `bge-small-en-v1.5` findet deutsche Anfragen praktisch nicht (Messung in Abschnitt 9). Idee: ein zweites, mehrsprachiges Modell (z. B. `paraphrase-multilingual-MiniLM-L12-v2`) parallel einbetten und nur für nicht-englische Anfragen nutzen. Der Vektor-Cache ist schon nach Modell getrennt. Kosten: doppelte Einbettzeit. Erst angehen, wenn nicht-englische Reports gebraucht werden.
 - [ ] **Rauschen bei Stacktraces:** Semantische Treffer aus Repos, die in keinem Frame vorkommen (z. B. `InvalidDecoratorItemException` aus nest bei einem eShop-Stacktrace), könnten abgewertet werden.
+- [ ] **Summaries mit echter API messen:** Qualität und tatsächliche Kosten mit `claude-haiku-5-5` auf eShop prüfen (braucht einen API-Key).
+- [ ] **Datei- und Modul-Summaries** aus den Symbol-Summaries aggregieren (Abschnitt 3.5).
+- [ ] **Batches-API für große Erstläufe:** halber Preis, dafür asynchron (Minuten bis Stunden).
 
 ---
 

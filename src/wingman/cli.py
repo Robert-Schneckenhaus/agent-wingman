@@ -21,6 +21,7 @@ from wingman import (
     notes,
     query,
     render,
+    summaries,
 )
 from wingman import endpoints as http
 from wingman.config import (
@@ -259,6 +260,7 @@ def index(app: AppContext, names: tuple[str, ...], full: bool, no_embed: bool) -
             click.echo(f"  warning: {error}", err=True)
         if len(stats.errors) > 5:
             click.echo(f"  ... {len(stats.errors) - 5} more warnings", err=True)
+    app.restore_summaries()
     if not no_embed:
         _embed(app, max_seconds=None, quiet_if_disabled=True)
     _echo_warnings(app)
@@ -312,6 +314,78 @@ def embed_cmd(app: AppContext, max_seconds: float | None) -> None:
     """Compute missing embeddings for semantic search (retries a failed model download)."""
     app.retry_embeddings()
     _embed(app, max_seconds=max_seconds, quiet_if_disabled=False)
+
+
+@main.command("summarize")
+@click.argument("names", nargs=-1)
+@click.option("--limit", type=int, help="Summarize at most this many symbols.")
+@click.option("--max-tokens", type=int, help="Token budget (default: max_tokens_per_run).")
+@click.option("--dry-run", is_flag=True, help="Only count candidates and estimate tokens.")
+@pass_app
+def summarize_cmd(
+    app: AppContext,
+    names: tuple[str, ...],
+    limit: int | None,
+    max_tokens: int | None,
+    dry_run: bool,
+) -> None:
+    """Write short LLM descriptions for undocumented code (repositories: default all).
+
+    Opt-in via [summaries] enabled = true; costs API tokens. Callees are summarized
+    before their callers; results are cached by code hash."""
+    config = app.config.summaries
+    if not dry_run and not config.enabled:
+        raise click.ClickException(
+            "LLM summaries are off. Enable them in .wingman/config.toml:\n"
+            "  [summaries]\n  enabled = true\n"
+            "Try 'wingman summarize --dry-run' for a token estimate first."
+        )
+    with app.engine.connect() as conn:
+        workspace_id = app.workspace_id(conn)
+        repos = store.list_repositories(conn, workspace_id)
+    repo_ids = None
+    if names:
+        unknown = set(names) - {r.name for r in repos}
+        if unknown:
+            raise click.ClickException(f"Unknown repositories: {', '.join(sorted(unknown))}")
+        repo_ids = [r.id for r in repos if r.name in names]
+    summarizer = None
+    if not dry_run:
+        try:
+            summarizer = app.summarizer
+        except summaries.SummaryError as exc:
+            raise click.ClickException(str(exc)) from exc
+    stats = summaries.summarize_workspace(
+        app.engine,
+        workspace_id,
+        config,
+        summarizer,
+        repo_ids=repo_ids,
+        limit=limit,
+        max_tokens=max_tokens,
+        dry_run=dry_run,
+        progress=lambda m: click.echo(m, err=True),
+    )
+    if dry_run:
+        click.echo(
+            f"{stats.candidates} symbols without documentation"
+            + (f" ({stats.skipped} in changed files, re-index first)" if stats.skipped else "")
+            + f"; about {stats.tokens:,} tokens in {stats.requests} requests ({config.model})"
+        )
+        return
+    click.echo(
+        f"summaries ({summarizer.model}): {stats.summarized} written, "
+        f"{stats.from_cache} from cache, {stats.failed} failed, {stats.remaining} remaining; "
+        f"{stats.tokens:,} tokens, {stats.seconds}s"
+    )
+    if stats.budget_exhausted:
+        click.echo("Token budget reached; run again to continue.", err=True)
+    for error in stats.errors[:5]:
+        click.echo(f"  warning: {error}", err=True)
+    if stats.errors and stats.summarized == 0:
+        raise SystemExit(1)
+    if stats.summarized or stats.from_cache:
+        _embed(app, max_seconds=None, quiet_if_disabled=True)
 
 
 # --- queries -------------------------------------------------------------------
@@ -657,6 +731,7 @@ def reindex_cmd(app: AppContext, paths: tuple[Path, ...]) -> None:
             f"{repo_info.name}: {stats.files_indexed} indexed, {stats.files_removed} removed, "
             f"{stats.files_unchanged} unchanged; {stats.seconds}s"
         )
+    app.restore_summaries()
 
 
 @main.group()
