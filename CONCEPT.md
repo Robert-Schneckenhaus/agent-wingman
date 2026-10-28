@@ -148,6 +148,8 @@ Jede Referenz speichert den Namen, wie er im Code steht (`target_name`), sowie d
 >   Der Post-Edit-Hook bettet nicht ein, damit er schnell bleibt.
 > - **Vektorsuche:** Brute-Force mit numpy über die normalisierten Vektoren, im Prozess gecacht, solange sich der Index nicht ändert. Gemessen: 19.500 Symbole, erste Abfrage 0,2 s, danach unter 0,05 s (ohne Modell-Inferenz). `sqlite-vec`/`pgvector` lohnen sich erst bei deutlich mehr Symbolen.
 > - **Fehlt das Modell** (offline, Download blockiert), degradiert die Suche zur reinen Volltextsuche mit Warnung statt Fehler.
+> - **Durchsatz beim Einbetten:** Die Texte werden nach Länge sortiert in Batches gegeben, sonst wird jeder Text auf den längsten im Batch aufgefüllt. Gemessen auf 4 CPU-Kernen mit Texten von durchschnittlich ca. 190 Tokens: unsortiert 6, sortiert 17 Texte/s.
+> - **Sprache:** `bge-small-en-v1.5` ist ein englisches Modell. Deutsche Bug-Reports zu englischem Code findet es praktisch nicht. Mehrsprachige Modelle wie `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` lassen sich über `model` konfigurieren. Im Stichprobentest auf 706 eShop-Symbolen fand dieses Modell deutsche Anfragen („Artikel aus dem Warenkorb entfernen“ → `CustomerBasket.RemoveItemFromBasket`), lag bei englischen Anfragen aber deutlich hinter `bge-small`. Deshalb bleibt `bge-small` der Standard.
 
 ### 3.7 Doc Ingestor – externe Doku
 
@@ -582,6 +584,17 @@ Die gute Nachricht: Git-Historien liefern Ground Truth gratis. Für jeden Bugfix
 | nestjs/nest (TS) | 2.157 | 83k Refs | 12 s | 1,5 s |
 
 Zusammen sind das 28 MB SQLite. Eine Suche dauert unter 1 s. Vererbung, Typreferenzen und Instanziierungen werden aufgelöst, soweit das Ziel im Repo liegt. Der größte Teil der unaufgelösten Referenzen sind Aufrufe in Framework- und Bibliothekscode (BCL, ASP.NET, npm). Das ist erwartet und wird mit Multi-Repo/Paketauflösung (Phase 3) und optionalen SCIP-Indizes kleiner.
+
+**Messung mit echter semantischer Suche (Phase 4, `bge-small-en-v1.5`, 4 CPU-Kerne):**
+
+- **Kosten:**
+  - Modell-Download ca. 70 MB, einmalig ca. 5 s.
+  - Laden des Modells ca. 1,3 s pro CLI-Aufruf; der MCP-Server lädt es nur einmal.
+  - Eine Anfrage einbetten: ca. 7 ms.
+- **Erst-Embedding aller drei Repos:** 14.930 Symbole in 15 min. Unveränderter Code wird danach nie wieder eingebettet.
+- **Prosa-Bug-Report** („buyer cancels an order that was already paid …“): `Order.SetCancelledStatus` steht mit Semantik auf Platz 1. Ohne Semantik ist es nicht unter den Top 8, dort dominieren die Integration-Event-Klassen aus dem Bezeichner im Text.
+- **Stacktrace:** Die Plätze 1 und 2 sind mit und ohne Semantik gleich (beide Frames). Mit Semantik rutscht auf Platz 3 eine ähnlich klingende Exception-Klasse aus einem anderen Repo (`InvalidDecoratorItemException` in nest), ein bekanntes Rauschen.
+- **Deutscher Bug-Report:** Ohne passende Treffer, siehe „Sprache“ in Abschnitt 3.6.
 
 ---
 

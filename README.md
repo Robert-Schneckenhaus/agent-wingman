@@ -94,9 +94,8 @@ wingman endpoints --clients --unmatched   # HTTP calls that match no known route
 ### Semantic search
 
 With the `embeddings` extra installed, search and context packs also find code by
-meaning, not only by matching words: synonyms, paraphrased bug reports, or a German
-description of English code. The default model `BAAI/bge-small-en-v1.5` runs locally (ONNX, no
-GPU needed) and is downloaded from Hugging Face on first use; code never leaves the
+meaning, not only by matching words: synonyms or paraphrased bug reports. The
+default model `BAAI/bge-small-en-v1.5` runs locally (ONNX, no GPU needed) and is downloaded from Hugging Face on first use; code never leaves the
 machine. Embeddings are computed at the end of `wingman index` (or with
 `wingman embed`) and cached by content, so unchanged code is never embedded twice.
 
@@ -105,6 +104,10 @@ machine. Embeddings are computed at the end of `wingman index` (or with
 enabled = "auto"          # auto | true | false   (env: WINGMAN_EMBEDDINGS=on|off|auto)
 model = "BAAI/bge-small-en-v1.5"
 ```
+
+The default model is English-only. For bug reports in other languages, configure a
+multilingual model such as `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
+(finds German queries, but ranks English ones noticeably worse).
 
 `--no-semantic` on `search`/`context` uses full-text search only. Without the model
 (offline, blocked download) everything keeps working with full-text search and a warning.
