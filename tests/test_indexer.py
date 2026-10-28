@@ -138,7 +138,7 @@ def test_edges(indexed):
 def test_incremental_reindex_only_parses_changed_files(indexed):
     stats = indexed.reindex("ts_app")
     assert stats.files_indexed == 0
-    assert stats.files_unchanged == 7
+    assert stats.files_unchanged == 9
 
     tax = indexed.root / "ts_app/src/billing/tax.ts"
     tax.write_text(tax.read_text().replace("breakdown(", "computeLines("))
@@ -176,7 +176,7 @@ def test_full_reindex_keeps_counts_stable(indexed):
     with indexed.engine.connect() as conn:
         before = conn.execute(select(func.count()).select_from(symbols)).scalar_one()
     stats = indexed.reindex("cs_app", full=True)
-    assert stats.files_indexed == 6
+    assert stats.files_indexed == 9
     with indexed.engine.connect() as conn:
         assert conn.execute(select(func.count()).select_from(symbols)).scalar_one() == before
         fts = conn.execute(text("SELECT count(*) FROM symbols_fts")).scalar_one()

@@ -66,9 +66,24 @@ class Import:
 
 
 @dataclass
+class Endpoint:
+    """An HTTP route served (``server``) or requested (``client``) by a symbol."""
+
+    role: str  # server|client
+    method: str | None
+    """GET/POST/...; None for "any" (e.g. [Route] without verb)."""
+    route: str
+    """Normalized, see ``wingman.endpoints.normalize_route``."""
+    symbol: int
+    """Index into ``Extraction.symbols``."""
+    line: int
+
+
+@dataclass
 class Extraction:
     symbols: list[Symbol] = field(default_factory=list)
     refs: list[Ref] = field(default_factory=list)
     imports: list[Import] = field(default_factory=list)
     namespaces: list[str] = field(default_factory=list)
     """C#: namespaces declared in the file."""
+    endpoints: list[Endpoint] = field(default_factory=list)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import time
 from pathlib import Path
 
 from sqlalchemy import Connection, Engine
@@ -13,6 +15,10 @@ from wingman.storage import db, store
 
 class WorkspaceError(Exception):
     pass
+
+
+EMBEDDING_FAILURE_FILE = "embeddings-unavailable"
+EMBEDDING_RETRY_SECONDS = 24 * 3600
 
 
 class Workspace:
@@ -60,11 +66,40 @@ class Workspace:
         """The configured embedder; None if semantic search is off or unavailable."""
         if not self._embedder_checked:
             self._embedder_checked = True
+            if self.config.embeddings.enabled is None and self._recent_embedding_failure():
+                # "auto": do not wait for a failing model download on every command
+                self._warn(
+                    "semantic search skipped: the embedding model could not be loaded "
+                    "recently (run `wingman embed` to retry)"
+                )
+                return None
             try:
                 self._embedder = embeddings.create_embedder(self.config.embeddings)
             except embeddings.EmbeddingError as exc:
                 self._warn(str(exc))
         return self._embedder
+
+    def _failure_file(self) -> Path:
+        return self.config.home / EMBEDDING_FAILURE_FILE
+
+    def _recent_embedding_failure(self) -> bool:
+        try:
+            age = time.time() - self._failure_file().stat().st_mtime
+        except OSError:
+            return False
+        return age < EMBEDDING_RETRY_SECONDS
+
+    def embedding_failed(self, error: Exception) -> None:
+        """Remember a failed model load (skipped in "auto" mode for a while)."""
+        self._embedder = None
+        self._warn(f"semantic search disabled: {error}")
+        with contextlib.suppress(OSError):
+            self._failure_file().write_text(f"{error}\n", encoding="utf-8")
+
+    def retry_embeddings(self) -> None:
+        """Forget a previous failure and load the embedder again on next use."""
+        self._failure_file().unlink(missing_ok=True)
+        self._embedder, self._embedder_checked = None, False
 
     def set_embedder(self, embedder: embeddings.Embedder | None) -> None:
         """Use a specific embedder (tests, other providers)."""
@@ -82,8 +117,7 @@ class Workspace:
                 self.engine, embedder, workspace_id, text, limit=limit
             )
         except embeddings.EmbeddingError as exc:
-            self._embedder = None  # do not retry a broken model in this process
-            self._warn(f"semantic search disabled: {exc}")
+            self.embedding_failed(exc)  # do not retry a broken model in this process
             return None
 
     def _warn(self, message: str) -> None:

@@ -22,6 +22,7 @@ from wingman import (
     query,
     render,
 )
+from wingman import endpoints as http
 from wingman.config import (
     CONFIG_FILE,
     DEFAULT_DB_FILE,
@@ -285,9 +286,9 @@ def _embed(app: AppContext, *, max_seconds: float | None, quiet_if_disabled: boo
             progress=lambda m: click.echo(m, err=True),
         )
     except embeddings.EmbeddingError as exc:
+        app.embedding_failed(exc)
         if not quiet_if_disabled:
             raise click.ClickException(str(exc)) from exc
-        click.echo(f"warning: embeddings skipped: {exc}", err=True)
         return
     if stats.pending or not quiet_if_disabled:
         rest = stats.pending - stats.embedded
@@ -308,7 +309,8 @@ def _echo_warnings(app: AppContext) -> None:
 @click.option("--max-seconds", type=float, help="Stop after this many seconds.")
 @pass_app
 def embed_cmd(app: AppContext, max_seconds: float | None) -> None:
-    """Compute missing embeddings for semantic search."""
+    """Compute missing embeddings for semantic search (retries a failed model download)."""
+    app.retry_embeddings()
     _embed(app, max_seconds=max_seconds, quiet_if_disabled=False)
 
 
@@ -534,6 +536,35 @@ def outline_cmd(app, path, as_json) -> None:
         )
     else:
         click.echo(render.outline(repo_name, rel, entries))
+
+
+@main.command("endpoints")
+@click.argument("route_filter", required=False)
+@click.option("--clients", is_flag=True, help="List HTTP client calls instead of server routes.")
+@click.option("--unmatched", is_flag=True, help="Only entries without a counterpart.")
+@repo_option
+@json_option
+@pass_app
+def endpoints_cmd(app, route_filter, clients, unmatched, repo, as_json) -> None:
+    """HTTP routes served in the workspace (or client calls) and how they are linked."""
+    role = "client" if clients else "server"
+    with app.engine.connect() as conn:
+        items = http.list_endpoints(conn, app.workspace_id(conn), role=role, contains=route_filter)
+        hits = query.get_symbols(conn, [i.symbol_id for i in items])
+    if repo:
+        items = [i for i in items if hits.get(i.symbol_id) and hits[i.symbol_id].repo == repo]
+    if unmatched:
+        items = [i for i in items if i.matches == 0]
+    if as_json:
+        _echo_json(
+            [
+                i.__dict__
+                | {"symbol": hits[i.symbol_id].to_dict() if i.symbol_id in hits else None}
+                for i in items
+            ]
+        )
+    else:
+        click.echo(render.endpoint_list(items, hits, role))
 
 
 # --- notes ---------------------------------------------------------------------

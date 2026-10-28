@@ -21,7 +21,8 @@ uv venv && uv pip install -e ".[dev]"   # or: python -m venv .venv && pip instal
 - `src/wingman/scanner.py` – which files get indexed
 - `src/wingman/extract/` – tree-sitter visitors per language (`typescript.py`, `csharp.py`)
 - `src/wingman/indexer.py` – incremental indexing (hash compare, store, FTS)
-- `src/wingman/resolver.py` – resolves imports, refs, inheritance; builds `symbol_edges`
+- `src/wingman/resolver.py` – resolves imports (incl. package.json registry), refs and
+  inheritance across the workspace for a scope of repositories; builds `symbol_edges`
 - `src/wingman/query.py` – read side used by CLI and MCP server
 - `src/wingman/context.py` – bug report/task text -> signals -> ranked context pack
 - `src/wingman/embeddings.py` – embedding texts, providers (fastembed), content-addressed
@@ -31,10 +32,13 @@ uv venv && uv pip install -e ".[dev]"   # or: python -m venv .venv && pip instal
 - `src/wingman/notes.py` – notes on symbols/files/directories (keyed by stable keys)
 - `src/wingman/workspace.py` – config + engine access shared by CLI, MCP server, hooks
 - `src/wingman/mcp_server.py` – MCP server (stdio, `wingman mcp`)
+- `src/wingman/endpoints.py` – HTTP route normalization and client -> server matching
+  (`http_call` refs, rebuilt workspace-wide after every change)
 - `src/wingman/hooks.py`, `claude_setup.py` – Claude Code hooks and `wingman claude install`
 - `tests/` – pytest; `tests/test_migrations.py` fails if schema and migrations diverge;
-  `tests/fixtures/{ts_app,cs_app}` are small repos with known expected resolutions;
-  the `indexed` (API) and `ws` (CLI) fixtures in `tests/conftest.py` index both
+  `tests/fixtures/{ts_app,cs_app,shared_lib}` are small repos with known expected
+  resolutions (incl. cross-repo packages and HTTP calls); the `indexed` (API) and `ws`
+  (CLI) fixtures in `tests/conftest.py` index all three
 
 ## Schema changes
 

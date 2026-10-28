@@ -3,7 +3,7 @@ import json
 
 def test_index_is_incremental(ws):
     result = ws("index", "ts_app")
-    assert "0 indexed, 7 unchanged" in result.output
+    assert "0 indexed, 9 unchanged" in result.output
     result = ws("index", "unknown", ok=False)
     assert result.exit_code != 0
     assert "Unknown repositories" in result.output
@@ -11,7 +11,7 @@ def test_index_is_incremental(ws):
 
 def test_status_shows_index_counts(ws):
     result = ws("status")
-    assert "13 files" in result.output
+    assert "21 files" in result.output
     assert "references resolved" in result.output
 
 

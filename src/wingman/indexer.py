@@ -12,12 +12,21 @@ from pathlib import Path
 from sqlalchemy import Connection, Engine, case, delete, func, insert, select, update
 
 from wingman import embeddings, git
+from wingman import endpoints as http
 from wingman.extract import content_hash, extract
 from wingman.extract.base import short_hash
 from wingman.extract.model import Extraction
-from wingman.resolver import resolve_repository
+from wingman.resolver import resolve_workspace
 from wingman.scanner import SourceFile, is_generated, is_test_path, scan, scan_paths
-from wingman.storage.schema import files, imports, index_runs, refs, repositories, symbols
+from wingman.storage.schema import (
+    endpoints,
+    files,
+    imports,
+    index_runs,
+    refs,
+    repositories,
+    symbols,
+)
 from wingman.storage.search import FtsRow, SearchBackend, backend_for
 from wingman.storage.store import RepoInfo
 
@@ -36,6 +45,8 @@ class IndexStats:
     refs: int = 0
     refs_resolved: int = 0
     edges: int = 0
+    http_calls: int = 0
+    """Client calls matched to server routes in the whole workspace (when re-matched)."""
     errors: list[str] = field(default_factory=list)
     seconds: float = 0.0
 
@@ -119,14 +130,17 @@ def index_repository(
         if stats.files_indexed or stats.files_removed:
             if progress and len(sources) > 200:
                 progress(f"{repo.name}: resolving references")
-            resolved = resolve_repository(conn, repo.id, root)
-            stats.refs_resolved, stats.refs, stats.edges = (
-                resolved.resolved,
-                resolved.refs,
-                resolved.edges,
-            )
-        else:  # nothing changed: keep the previous resolution
-            stats.refs, stats.refs_resolved = _ref_counts(conn, repo.id)
+            workspace_id = conn.execute(
+                select(repositories.c.workspace_id).where(repositories.c.id == repo.id)
+            ).scalar_one()
+            http.clear_http_refs(conn, workspace_id)  # rebuilt below, never "stale"
+            # references from other repositories into deleted symbols lost their target
+            scope = {repo.id} | _repos_with_stale_refs(conn, workspace_id)
+            if not existing:  # first index: other repositories may now resolve into it
+                scope |= _workspace_repos(conn, workspace_id)
+            stats.edges = resolve_workspace(conn, workspace_id, scope).edges
+            stats.http_calls = http.match_endpoints(conn, workspace_id)
+        stats.refs, stats.refs_resolved = _ref_counts(conn, repo.id)
         stats.seconds = round(time.monotonic() - started, 2)
 
         now = datetime.now(UTC)
@@ -146,6 +160,31 @@ def index_repository(
             .values(last_commit=commit, updated_at=now)
         )
     return stats
+
+
+def _workspace_repos(conn: Connection, workspace_id: int) -> set[int]:
+    return set(
+        conn.execute(
+            select(repositories.c.id).where(repositories.c.workspace_id == workspace_id)
+        ).scalars()
+    )
+
+
+def _repos_with_stale_refs(conn: Connection, workspace_id: int) -> set[int]:
+    """Repositories with references that were resolved, but whose target was deleted."""
+    return set(
+        conn.execute(
+            select(files.c.repo_id)
+            .distinct()
+            .join(refs, refs.c.from_file_id == files.c.id)
+            .join(repositories, repositories.c.id == files.c.repo_id)
+            .where(
+                repositories.c.workspace_id == workspace_id,
+                refs.c.to_symbol_id.is_(None),
+                refs.c.resolver.is_not(None),
+            )
+        ).scalars()
+    )
 
 
 def _ref_counts(conn: Connection, repo_id: int) -> tuple[int, int]:
@@ -257,6 +296,20 @@ def _store_file(
                     "resolver": None,
                 }
                 for r in extraction.refs
+            ],
+        )
+    if extraction.endpoints:
+        conn.execute(
+            insert(endpoints),
+            [
+                {
+                    "symbol_id": ids[e.symbol],
+                    "role": e.role,
+                    "http_method": e.method,
+                    "route_pattern": e.route,
+                    "line": e.line,
+                }
+                for e in extraction.endpoints
             ],
         )
     if extraction.imports:

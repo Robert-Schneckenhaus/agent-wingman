@@ -131,6 +131,12 @@ class FastEmbedEmbedder:
         if self._impl is None:
             from fastembed import TextEmbedding
 
+            try:  # fastembed logs every download retry as an ERROR; we report failures
+                from loguru import logger
+
+                logger.disable("fastembed")
+            except ImportError:
+                pass
             try:
                 self._impl = TextEmbedding(model_name=self.model, cache_dir=str(self.cache_dir))
             except Exception as exc:

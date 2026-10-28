@@ -7,8 +7,9 @@ from dataclasses import dataclass, field, replace
 
 from tree_sitter import Node
 
+from wingman.endpoints import is_url_path, join_routes, normalize_route
 from wingman.extract.base import ExtractorBase, collapse, strip_generics, value_type
-from wingman.extract.model import Extraction, Import
+from wingman.extract.model import Endpoint, Extraction, Import
 
 _MODIFIER_TOKENS = {"static", "async", "readonly", "abstract", "override", "declare", "get", "set"}
 _FUNCTION_VALUES = {"arrow_function", "function_expression", "function", "generator_function"}
@@ -16,6 +17,14 @@ _JSX_NODES = {"jsx_element", "jsx_self_closing_element", "jsx_fragment"}
 # Jest/Mocha/Vitest/Jasmine blocks that become symbols, so tests are findable by name
 _TEST_SUITES = {"describe", "context", "suite", "fdescribe", "xdescribe"}
 _TEST_CASES = {"it", "test", "specify", "fit", "xit"}
+# HTTP endpoints
+_HTTP_VERBS = {"get": "GET", "post": "POST", "put": "PUT", "delete": "DELETE", "patch": "PATCH"}
+_NEST_CONTROLLER = re.compile(
+    r"@Controller\(\s*(?:['\"`]([^'\"`]*)['\"`]|\{[^}]*?path\s*:\s*['\"`]([^'\"`]*)['\"`])?"
+)
+_NEST_ROUTE = re.compile(r"@(Get|Post|Put|Delete|Patch|All)\(\s*(?:['\"`]([^'\"`]*)['\"`])?")
+_CLIENT_RECEIVER = re.compile(r"(axios|http|httpclient|client|api)$", re.IGNORECASE)
+_EXPRESS_RECEIVERS = {"app", "router", "server", "routes", "api", "r"}
 _TS_TYPE_SKIP = re.compile(r"^[A-Z]$")  # generic type parameters like T
 
 
@@ -31,6 +40,8 @@ class _Ctx:
     locals: dict[str, str] = field(default_factory=dict)
     """Enclosing function: variable/parameter name -> declared type."""
     in_function: bool = False
+    route_prefix: str | None = None
+    """NestJS: path of the enclosing @Controller."""
 
 
 def normalize_jsdoc(comments: list[str]) -> str | None:
@@ -48,7 +59,15 @@ def normalize_jsdoc(comments: list[str]) -> str | None:
 class TypeScriptExtractor(ExtractorBase):
     def extract(self, root: Node) -> Extraction:
         self._seen_type_refs: set[tuple[int | None, str]] = set()
+        self._strings: dict[str, str] = {}  # known string constants, for URLs
+        self._handlers: list[tuple[Endpoint, str]] = []
         self.visit_children(root, _Ctx())
+        for endpoint, handler in self._handlers:  # app.get("/x", handlerFunction)
+            for index, sym in enumerate(self.out.symbols):
+                if sym.name == handler and sym.kind in ("function", "method"):
+                    endpoint.symbol = index
+                    break
+        self.out.endpoints = [e for e in self.out.endpoints if e.symbol is not None]
         return self.out
 
     # --- traversal --------------------------------------------------------------
@@ -202,6 +221,10 @@ class TypeScriptExtractor(ExtractorBase):
             decorators=decorators,
             doc=self._own_doc(node, doc),
         )
+        decorator_nodes = [c for c in node.children if c.type == "decorator"]
+        if node.parent is not None and node.parent.type == "export_statement":
+            decorator_nodes += [c for c in node.parent.children if c.type == "decorator"]
+        self.decorator_refs(decorator_nodes, ctx, index)
         for child in node.named_children:
             if child.type == "class_heritage":
                 self.heritage(child, index)
@@ -215,8 +238,21 @@ class TypeScriptExtractor(ExtractorBase):
             return
         class_ctx = _Ctx(symbol=index, prefix=self.qualified(index), cls=index)
         class_ctx.fields = self.collect_fields(body)
+        controller = _NEST_CONTROLLER.search(" ".join(decorators))
+        if controller:
+            class_ctx.route_prefix = controller.group(1) or controller.group(2) or ""
+        pending: list[Node] = []  # decorators precede their member as siblings
         for member in body.named_children:
-            self.member(member, class_ctx, interface=kind == "interface")
+            if member.type == "decorator":
+                pending.append(member)
+                continue
+            self.member(member, class_ctx, interface=kind == "interface", decorators=pending)
+            pending = []
+
+    def decorator_refs(self, decorators: list[Node], ctx: _Ctx, index: int) -> None:
+        """``@Injectable()`` is a call of ``Injectable`` made by the decorated symbol."""
+        for decorator in decorators:
+            self.visit_children(decorator, replace(ctx, symbol=index))
 
     def heritage(self, node: Node, class_index: int) -> None:
         for clause in node.named_children:
@@ -255,7 +291,11 @@ class TypeScriptExtractor(ExtractorBase):
                             fields[name] = type_name
         return fields
 
-    def member(self, node: Node, ctx: _Ctx, *, interface: bool) -> None:
+    def member(
+        self, node: Node, ctx: _Ctx, *, interface: bool, decorators: list[Node] | None = None
+    ) -> None:
+        decorator_nodes = (decorators or []) + [c for c in node.children if c.type == "decorator"]
+        decorators = [self.text(d) for d in decorator_nodes]
         if node.type in ("method_definition", "method_signature", "abstract_method_signature"):
             name = self.text(node.child_by_field_name("name"))
             body = node.child_by_field_name("body")
@@ -272,10 +312,13 @@ class TypeScriptExtractor(ExtractorBase):
                 signature=self.header(node, body),
                 visibility=self.accessibility(node) or ("public" if interface else None),
                 modifiers=modifiers,
-                decorators=[self.text(c) for c in node.children if c.type == "decorator"],
+                decorators=decorators,
                 doc=normalize_jsdoc(self.preceding_comments(node)),
                 type_name=self.return_type(node),
             )
+            if ctx.route_prefix is not None:
+                self.nest_endpoints(decorators, ctx.route_prefix, index, node)
+            self.decorator_refs(decorator_nodes, ctx, index)
             self.function_body(node, ctx, index)
         elif node.type in ("public_field_definition", "property_signature"):
             name = self.text(node.child_by_field_name("name"))
@@ -292,7 +335,7 @@ class TypeScriptExtractor(ExtractorBase):
                 ),
                 visibility=self.accessibility(node) or ("public" if interface else None),
                 modifiers=self.modifier_tokens(node),
-                decorators=[self.text(c) for c in node.children if c.type == "decorator"],
+                decorators=decorators,
                 doc=normalize_jsdoc(self.preceding_comments(node)),
                 type_name=(
                     self.return_type(value)
@@ -300,6 +343,7 @@ class TypeScriptExtractor(ExtractorBase):
                     else ctx.fields.get(name) or self.annotation_type(node)
                 ),
             )
+            self.decorator_refs(decorator_nodes, ctx, index)
             type_node = node.child_by_field_name("type")
             if type_node is not None:
                 self.visit(type_node, replace(ctx, symbol=index))
@@ -357,6 +401,9 @@ class TypeScriptExtractor(ExtractorBase):
             name_node = declarator.child_by_field_name("name")
             value = declarator.child_by_field_name("value")
             name = self.text(name_node)
+            text_value = self.string_value(value)
+            if text_value is not None and name_node is not None:
+                self._strings[name] = text_value
 
             if ctx.in_function:
                 type_name = self.annotation_type(declarator) or self.new_type(value)
@@ -455,7 +502,98 @@ class TypeScriptExtractor(ExtractorBase):
                 self.add_ref(function, "call", self.text(function), ctx.symbol)
             elif function.type == "member_expression":
                 self.member_ref(function, "call", ctx)
+            self.http_endpoint(node, function, ctx)
         self.visit_children(node, ctx)
+
+    # --- HTTP endpoints -------------------------------------------------------------
+
+    def nest_endpoints(self, decorators: list[str], prefix: str, index: int, node: Node) -> None:
+        for verb, path in _NEST_ROUTE.findall(" ".join(decorators)):
+            method = None if verb == "All" else verb.upper()
+            route = normalize_route(join_routes(prefix, path))
+            self.out.endpoints.append(Endpoint("server", method, route, index, self.line(node)))
+
+    def http_endpoint(self, node: Node, function: Node, ctx: _Ctx) -> None:
+        """fetch/axios/HttpClient calls (client) and Express-style routes (server)."""
+        arguments = node.child_by_field_name("arguments")
+        args = [a for a in arguments.named_children if a.type != "comment"] if arguments else []
+        if not args:
+            return
+        if function.type == "identifier" and self.text(function) == "fetch":
+            method = self.option_method(args[1]) if len(args) > 1 else None
+            self.client_endpoint(args[0], method or "GET", node, ctx)
+            return
+        if function.type != "member_expression":
+            return
+        verb = _HTTP_VERBS.get(self.text(function.child_by_field_name("property")))
+        receiver = function.child_by_field_name("object")
+        if verb is None or receiver is None:
+            return
+        receiver_name = self.text(receiver).rsplit(".", 1)[-1]
+        handler = args[-1]
+        is_route = (
+            receiver_name in _EXPRESS_RECEIVERS
+            and len(args) >= 2
+            and (handler.type in _FUNCTION_VALUES or handler.type == "identifier")
+        )
+        if is_route:
+            path = self.string_value(args[0])
+            if path is None or not path.startswith("/"):
+                return
+            endpoint = Endpoint("server", verb, normalize_route(path), ctx.symbol, self.line(node))
+            self.out.endpoints.append(endpoint)
+            if handler.type == "identifier":
+                self._handlers.append((endpoint, self.text(handler)))
+        elif _CLIENT_RECEIVER.search(receiver_name):
+            self.client_endpoint(args[0], verb, node, ctx)
+
+    def client_endpoint(self, url_node: Node, method: str, node: Node, ctx: _Ctx) -> None:
+        url = self.string_value(url_node)
+        if ctx.symbol is None or not is_url_path(url):
+            return
+        self.out.endpoints.append(
+            Endpoint("client", method, normalize_route(url), ctx.symbol, self.line(node))
+        )
+
+    def option_method(self, options: Node) -> str | None:
+        """``{ method: "POST" }`` -> ``POST``."""
+        if options.type != "object":
+            return None
+        for pair in options.named_children:
+            if pair.type == "pair" and self.text(pair.child_by_field_name("key")) == "method":
+                value = self.string_value(pair.child_by_field_name("value"))
+                return value.upper() if value else None
+        return None
+
+    def string_value(self, node: Node | None) -> str | None:
+        """Best-effort value of a string expression; unknown parts become ``{}``, an
+        unknown *leading* part (a base URL) is dropped."""
+        if node is None:
+            return None
+        if node.type == "string":
+            return "".join(self.text(c) for c in node.named_children if c.type == "string_fragment")
+        if node.type == "identifier":
+            return self._strings.get(self.text(node))
+        if node.type == "template_string":
+            parts: list[str] = []
+            for child in node.named_children:
+                if child.type == "string_fragment":
+                    parts.append(self.text(child))
+                elif child.type == "template_substitution":
+                    inner = child.named_children[0] if child.named_children else None
+                    known = self._strings.get(self.text(inner)) if inner is not None else None
+                    if known is not None:
+                        parts.append(known)
+                    elif parts:
+                        parts.append("{}")
+            return "".join(parts)
+        if node.type == "binary_expression":
+            left = self.string_value(node.child_by_field_name("left"))
+            right = self.string_value(node.child_by_field_name("right"))
+            if left is None and right is None:
+                return None
+            return (left if left is not None else "") + (right if right is not None else "{}")
+        return None
 
     def test_block(self, node: Node, function: Node, ctx: _Ctx) -> bool:
         """``describe("x", () => ...)`` / ``it.only("y", ...)`` -> test_suite / test symbol."""

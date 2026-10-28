@@ -33,4 +33,7 @@ public class InvoicesController : ApiControllerBase
     }
 
     private Invoice Load(int id) => new Invoice();
+
+    [HttpPost]
+    public IActionResult Create(Invoice invoice) => Ok(invoice);
 }

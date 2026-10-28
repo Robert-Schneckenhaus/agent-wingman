@@ -13,7 +13,7 @@ from wingman.extract.model import Extraction
 
 # Bump when extractors (or the indexer) change what they produce: it is part of every
 # file's content hash, so the next `wingman index` re-parses all files.
-EXTRACTOR_VERSION = "3"
+EXTRACTOR_VERSION = "6"
 
 
 def content_hash(data: bytes) -> str:

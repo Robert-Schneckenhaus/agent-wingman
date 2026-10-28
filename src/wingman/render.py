@@ -6,6 +6,7 @@ open exactly the right lines.
 
 from __future__ import annotations
 
+from wingman.endpoints import EndpointInfo
 from wingman.query import OutlineEntry, RefHit, SymbolDetails, SymbolHit
 from wingman.storage.store import Note
 
@@ -116,4 +117,19 @@ def outline(repo: str, path: str, entries: list[OutlineEntry]) -> str:
         lines.append(f"  {span:>9}  {'  ' * entry.depth}{s.kind} {s.name}")
     if not entries:
         lines.append("  (no symbols)")
+    return "\n".join(lines)
+
+
+def endpoint_list(items: list[EndpointInfo], hits: dict[int, SymbolHit], role: str) -> str:
+    if not items:
+        return "No endpoints." if role == "server" else "No HTTP client calls."
+    counterpart = "client" if role == "server" else "server"
+    lines = []
+    for item in items:
+        hit = hits.get(item.symbol_id)
+        where = f"{hit.qualified_name}  [{hit.location}]" if hit else "?"
+        if hit and item.line and not hit.start_line <= item.line <= hit.end_line:
+            where += f" (mapped at line {item.line})"
+        matches = f"{item.matches} {counterpart}{'s' if item.matches != 1 else ''}"
+        lines.append(f"{item.method or 'ANY':<6} /{item.route}  -> {where}  ({matches})")
     return "\n".join(lines)

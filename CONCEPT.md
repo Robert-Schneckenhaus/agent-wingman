@@ -364,6 +364,15 @@ CREATE TABLE endpoints (
 
 Server- und Client-Endpunkte mit gleichem `(http_method, route_pattern)` werden zu `refs` mit `kind = 'http_call'` verbunden. Damit funktionieren `get_callers` und die Graph-Expansion über die Grenze zwischen Frontend und Backend hinweg.
 
+> *Umgesetzt in Phase 3:*
+> - **Workspace-weiter Resolver** (`resolver.py`): Die Nachschlagetabellen umfassen alle Repos. Neu berechnet werden aber nur die Referenzen der Repos „im Scope“, also das geänderte Repo, Repos mit Referenzen in gelöschte Symbole und beim Erstindex eines Repos alle. Auflösung nur über den Namen (0,5) bleibt im eigenen Repo; repo-übergreifend zählt nur explizite Evidenz (Import, `using`).
+> - **Pakete:** Alle `package.json` im Workspace (auch Monorepo-Pakete) bilden eine Registry. `import … from "@acme/shared"` bzw. `"@acme/shared/sub"` löst über `source`/`types`/`module`/`main` auf, wobei `dist/index.js` auf `src/index.ts` zurückgeführt wird, mit Fallback `src/index`. C#-`using`s finden Namespaces aus allen Repos.
+> - **Server-Routen:** ASP.NET-Controller (`[Route("api/[controller]")]` + `[HttpGet("{id}")]`, `~/` absolut, konventionell `controller/action`), Minimal APIs (`MapGroup(…)…MapGet("/x", Handler)`, auch mit `.HasApiVersion(…)` dazwischen, Handler als Method-Group wird dem Handler zugeordnet), NestJS (`@Controller` + `@Get`) und Express (`app.get('/x', handler)`).
+> - **Client-Aufrufe:** `fetch` (mit `method`), `axios.*`, Angular `this.http.get` sowie .NET `HttpClient.Get/Post/…Async` und `…AsJsonAsync`. Bekannte String-Konstanten und -Felder werden eingesetzt (`$"{remoteServiceBaseUrl}items/{id}"`). Ein unbekannter Anfang (Basis-URL) wird verworfen.
+> - **Matching:** Routen werden normalisiert (Parameter, auch `{id:int?}`/`:id`/`${…}` → `{}`, Kleinschreibung, ohne Host und Query). Volle Übereinstimmung ergibt 0,9; Suffix bei unbekannter Basis-URL ergibt 0,6, dabei müssen literale Segmente exakt passen. Bei mehreren Kandidaten gewinnt die spezifischste Route (`items/by` vor `items/{id}`). Die `http_call`-Referenzen werden nach jeder Änderung workspace-weit neu aufgebaut. `wingman endpoints` bzw. das MCP-Tool `list_endpoints` zeigen Routen, Handler und Anzahl der Gegenstellen.
+> - **Gemessen an dotnet/eShop:** 45 Server-Routen (Catalog, Ordering, Webhooks, Identity) und 63 Client-Aufrufe (WebApp, HybridApp, WebhookClient, Functional Tests), davon 62 einer Route zugeordnet. Bei nestjs/nest lösen 4.422 von 4.783 `@nestjs/*`-Imports in die Monorepo-Pakete auf; 543 Controller-Routen werden erkannt.
+> - **Noch offen:** Messaging (Topics/Queues), gRPC sowie DTO-Abgleich über Namen.
+
 ### 4.4 Volltextsuche
 
 - **SQLite**: `FTS5`-Virtual-Table über `symbols(name, qualified_name, signature, doc, summary)`, `doc_chunks(heading_path, text)` und optional Datei-Inhalt. Tokenizer `unicode61` mit `tokenchars '_'`, dazu eine eigene Vorverarbeitung, die `camelCase`/`snake_case` splittet, damit `InvoiceService` auch bei „invoice service“ trifft.
@@ -520,6 +529,7 @@ agent-wingman/
 │   ├── claude_setup.py         # wingman claude install/uninstall
 │   ├── (später) enrich/        # LLM-Summaries, Provider-Interface
 │   ├── embeddings.py           # Embedding-Texte, Provider, Vektor-Cache, semantische Suche
+│   ├── endpoints.py            # HTTP-Routen normalisieren, Client ↔ Server matchen
 │   ├── (später) docs/          # PDF/URL/MD-Ingest, Chunker, Linker
 │   ├── storage/
 │   │   ├── schema.py           # SQLAlchemy Core Tabellen
@@ -545,7 +555,7 @@ Der Prototyp ist auf **einen Entwickler mit lokaler SQLite-DB** ausgelegt. Das D
 | **0 – Skeleton** ✅ | `pyproject`, CLI-Gerüst, Config, SQLite-Schema + Alembic, Workspace/Repo-Verwaltung | `wingman init`, `wingman repo add` laufen |
 | **1 – Strukturindex** ✅ | Scanner, tree-sitter für **TypeScript + C#**, Symbole, Imports, Refs, lokaler/Import-Resolver (inkl. `tsconfig`-Pfade, C#-Namespaces), FTS5 | `wingman index`, `search`, `symbol`, `callers`, `callees`, `outline` |
 | **2 – MCP** ✅ | MCP-Server mit Kern-Tools, Context Pack, inkrementelles Indexing, Hooks | In Claude Code nutzbar |
-| **3 – Multi-Repo** | Paket-Abhängigkeiten zwischen Repos, HTTP-Endpunkt-Matching (ASP.NET ↔ fetch/axios) | Agent folgt Aufrufen vom Frontend ins Backend |
+| **3 – Multi-Repo** ✅ | Paket-Abhängigkeiten zwischen Repos, HTTP-Endpunkt-Matching (ASP.NET ↔ fetch/axios) | Agent folgt Aufrufen vom Frontend ins Backend |
 | **4 – Semantik** ✅ (vorgezogen) | Embeddings (lokal, fastembed), inhaltsadressierter Vektor-Cache, Hybrid-Suche (gewichtete Fusion statt RRF) + Graph-Expansion. Noch offen: Qualitätsmessung mit echtem Modell, `sqlite-vec` erst bei Bedarf | Bug-Report → relevante Stellen |
 | **5 – Summaries** | LLM-Enricher bottom-up (Anthropic, kleines Modell, Opt-in), Cache, Budget, Datei-/Modul-Summaries | Undokumentierter Code wird durchsuchbar |
 | **6 – Externe Doku** | PDF/URL/MD/OpenAPI-Ingest, Chunking, Auto-Linking | Spezifikationen hängen am Code |

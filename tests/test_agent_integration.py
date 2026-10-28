@@ -54,7 +54,7 @@ def test_hook_commands_never_fail(runner, tmp_path, monkeypatch):
 
 def test_session_start_reports_index(ws, runner):
     result = ws("hook", "session-start")
-    assert result.output.startswith("agent-wingman: code index ready (2 repos, 13 files")
+    assert result.output.startswith("agent-wingman: code index ready (3 repos, 21 files")
     assert "find_relevant_for_task" in result.output
 
 

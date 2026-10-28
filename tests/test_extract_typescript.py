@@ -184,3 +184,21 @@ describe("TaxCalculator", () => {
     run = next(r for r in result.refs if r.target_name == "run")
     assert run.qualifier_type == "Calc"
     assert result.symbols[run.from_symbol].kind == "test"
+
+
+def test_decorators_are_calls_of_the_decorated_symbol():
+    result = _extract(
+        """
+@Component({ selector: "x" })
+export class A {
+  @Input() name: string;
+  @Get(":id") find() {}
+}
+"""
+    )
+    calls = {
+        (r.target_name, result.symbols[r.from_symbol].qualified_name)
+        for r in result.refs
+        if r.kind == "call"
+    }
+    assert calls == {("Component", "A"), ("Input", "A.name"), ("Get", "A.find")}

@@ -12,6 +12,7 @@ from wingman.indexer import index_repository
 from wingman.storage import db, store
 
 FIXTURES = Path(__file__).parent / "fixtures"
+REPOS = ("ts_app", "cs_app", "shared_lib")
 
 
 @pytest.fixture(autouse=True)
@@ -45,24 +46,24 @@ class IndexedWorkspace:
 
 @pytest.fixture
 def indexed(tmp_path) -> IndexedWorkspace:
-    """Both fixture repositories copied to a temp dir and indexed into a fresh DB."""
+    """All fixture repositories copied to a temp dir and indexed into a fresh DB."""
     engine = db.create_db_engine(f"sqlite:///{tmp_path / 'index.db'}")
     db.upgrade(engine)
     with engine.begin() as conn:
         workspace_id = store.ensure_workspace(conn, "test")
-        for name in ("ts_app", "cs_app"):
+        for name in REPOS:
             shutil.copytree(FIXTURES / name, tmp_path / name)
             store.add_repository(conn, workspace_id, name, (tmp_path / name).as_posix())
     workspace = IndexedWorkspace(engine, workspace_id, tmp_path)
-    for name in ("ts_app", "cs_app"):
+    for name in REPOS:
         workspace.reindex(name)
     return workspace
 
 
 @pytest.fixture
 def ws(tmp_path, runner, monkeypatch):
-    """CLI workspace with both fixture repositories added and indexed."""
-    for name in ("ts_app", "cs_app"):
+    """CLI workspace with all fixture repositories added and indexed."""
+    for name in REPOS:
         shutil.copytree(FIXTURES / name, tmp_path / name)
     monkeypatch.chdir(tmp_path)
 
@@ -73,9 +74,10 @@ def ws(tmp_path, runner, monkeypatch):
         return result
 
     run("init", "--workspace", "demo")
-    run("repo", "add", "ts_app")
-    run("repo", "add", "cs_app")
+    for name in REPOS:
+        run("repo", "add", name)
     result = run("index")
-    assert "ts_app: 7 indexed" in result.output
-    assert "cs_app: 6 indexed" in result.output
+    assert "ts_app: 9 indexed" in result.output
+    assert "cs_app: 9 indexed" in result.output
+    assert "shared_lib: 3 indexed" in result.output
     return run

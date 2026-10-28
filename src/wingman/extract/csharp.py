@@ -8,8 +8,9 @@ from dataclasses import dataclass, field, replace
 
 from tree_sitter import Node
 
+from wingman.endpoints import is_url_path, join_routes, normalize_route
 from wingman.extract.base import ExtractorBase, collapse, strip_generics, value_type
-from wingman.extract.model import Extraction, Import
+from wingman.extract.model import Endpoint, Extraction, Import
 
 _TYPE_DECLARATIONS = {
     "class_declaration": "class",
@@ -24,6 +25,36 @@ _INTERFACE_NAME = re.compile(r"^I[A-Z]")
 _XML_TAG = re.compile(r"<(\w+)([^>]*)>(.*?)</\1>", re.DOTALL)
 _XML_EMPTY_TAG = re.compile(r"<(?:see|seealso|paramref|typeparamref)\s+\w+=\"([^\"]*)\"\s*/>")
 
+# ASP.NET routing
+_HTTP_ATTRIBUTE = re.compile(
+    r"\bHttp(Get|Post|Put|Delete|Patch)(?:Attribute)?\b\s*(?:\(\s*(?:template\s*:\s*)?\"([^\"]*)\")?"
+)
+_ROUTE_ATTRIBUTE = re.compile(r"\bRoute(?:Attribute)?\s*\(\s*(?:template\s*:\s*)?\"([^\"]*)\"")
+_MAP_METHODS = {
+    "MapGet": "GET",
+    "MapPost": "POST",
+    "MapPut": "PUT",
+    "MapDelete": "DELETE",
+    "MapPatch": "PATCH",
+}
+# HttpClient calls (System.Net.Http + System.Net.Http.Json)
+_CLIENT_METHODS = {
+    "GetAsync": "GET",
+    "GetFromJsonAsync": "GET",
+    "GetStringAsync": "GET",
+    "GetStreamAsync": "GET",
+    "GetByteArrayAsync": "GET",
+    "PostAsync": "POST",
+    "PostAsJsonAsync": "POST",
+    "PutAsync": "PUT",
+    "PutAsJsonAsync": "PUT",
+    "PatchAsync": "PATCH",
+    "PatchAsJsonAsync": "PATCH",
+    "DeleteAsync": "DELETE",
+    "DeleteFromJsonAsync": "DELETE",
+}
+_CLIENT_RECEIVER = re.compile(r"http|client", re.IGNORECASE)
+
 
 @dataclass
 class _Ctx:
@@ -32,6 +63,14 @@ class _Ctx:
     cls: int | None = None
     fields: dict[str, str] = field(default_factory=dict)
     locals: dict[str, str] = field(default_factory=dict)
+    strings: dict[str, str] = field(default_factory=dict)
+    """Known string values of fields/constants/locals (for URLs)."""
+    groups: dict[str, str] = field(default_factory=dict)
+    """Minimal APIs: local variable -> route prefix of its MapGroup."""
+    route_prefix: str | None = None
+    """[Route] of the enclosing controller (``[controller]`` already replaced)."""
+    controller: str | None = None
+    """Name of the enclosing ``...Controller`` class without the suffix."""
 
 
 def normalize_xml_doc(comments: list[str]) -> str | None:
@@ -64,8 +103,18 @@ def normalize_xml_doc(comments: list[str]) -> str | None:
 class CSharpExtractor(ExtractorBase):
     def extract(self, root: Node) -> Extraction:
         self._seen_type_refs: set[tuple[int | None, str]] = set()
+        self._handlers: list[tuple[Endpoint, str, int | None]] = []
         self.visit_children(root, _Ctx())
+        self._bind_handlers()
         return self.out
+
+    def _bind_handlers(self) -> None:
+        """``MapGet("/x", GetItem)``: attribute the route to the method ``GetItem``."""
+        for endpoint, handler, type_index in self._handlers:
+            for index, sym in enumerate(self.out.symbols):
+                if sym.name == handler and sym.parent == type_index and sym.kind == "method":
+                    endpoint.symbol = index
+                    break
 
     # --- traversal --------------------------------------------------------------
 
@@ -149,6 +198,15 @@ class CSharpExtractor(ExtractorBase):
             doc=normalize_xml_doc(self.preceding_comments(node)),
         )
         type_ctx = _Ctx(symbol=index, prefix=self.qualified(index), cls=index)
+        type_ctx.strings = dict(ctx.strings)
+        class_route = _ROUTE_ATTRIBUTE.search(" ".join(self.attributes(node)))
+        controller = re.sub(r"Controller$", "", name)
+        if name.endswith("Controller") and controller:
+            type_ctx.controller = controller
+        if class_route:
+            type_ctx.route_prefix = re.sub(
+                r"\[controller\]", controller, class_route.group(1), flags=re.IGNORECASE
+            )
 
         for child in node.named_children:
             if child.type == "base_list":
@@ -169,6 +227,7 @@ class CSharpExtractor(ExtractorBase):
         if body is None or kind == "enum":
             return
         type_ctx.fields.update(self.collect_fields(body))
+        type_ctx.strings.update(self.collect_strings(body, type_ctx))
         for member in body.named_children:
             self.member(member, type_ctx, interface=kind == "interface")
 
@@ -207,6 +266,26 @@ class CSharpExtractor(ExtractorBase):
                 )
         return fields
 
+    def collect_strings(self, body: Node, ctx: _Ctx) -> dict[str, str]:
+        """Values of string fields/constants, e.g. a base URL used for HTTP calls."""
+        values: dict[str, str] = {}
+        for member in body.named_children:
+            if member.type != "field_declaration":
+                continue
+            declaration = next(
+                (c for c in member.named_children if c.type == "variable_declaration"), None
+            )
+            for declarator in declaration.named_children if declaration is not None else ():
+                if declarator.type != "variable_declarator":
+                    continue
+                value_node = next(
+                    (c for c in declarator.named_children if c.type != "identifier"), None
+                )
+                value = self.string_value(value_node, ctx) if value_node is not None else None
+                if value is not None:
+                    values[self.text(declarator.child_by_field_name("name"))] = value
+        return values
+
     def member(self, node: Node, ctx: _Ctx, *, interface: bool) -> None:
         kind = {
             "method_declaration": "method",
@@ -244,7 +323,16 @@ class CSharpExtractor(ExtractorBase):
             doc=normalize_xml_doc(self.preceding_comments(node)),
             type_name=value_type(self.text(declared)) if declared is not None else None,
         )
-        member_ctx = replace(ctx, symbol=index, prefix=self.qualified(index), locals={})
+        member_ctx = replace(
+            ctx,
+            symbol=index,
+            prefix=self.qualified(index),
+            locals={},
+            strings=dict(ctx.strings),
+            groups={},
+        )
+        if kind == "method":
+            self.controller_endpoints(node, index, name, ctx)
         params = node.child_by_field_name("parameters")
         for param in params.named_children if params is not None else ():
             type_node = param.child_by_field_name("type")
@@ -323,6 +411,16 @@ class CSharpExtractor(ExtractorBase):
                 type_name = declared or self.creation_type(declarator)
                 if name and type_name:
                     ctx.locals[name] = type_name
+                value_node = next(
+                    (c for c in declarator.named_children if c.type != "identifier"), None
+                )
+                if name and value_node is not None:
+                    value = self.string_value(value_node, ctx)
+                    if value is not None:
+                        ctx.strings[name] = value
+                    group = self.group_prefix(value_node, ctx)
+                    if group is not None:
+                        ctx.groups[name] = group
         self.visit_children(node, ctx)
 
     def creation_type(self, declarator: Node) -> str | None:
@@ -338,7 +436,133 @@ class CSharpExtractor(ExtractorBase):
                 self.add_ref(function, "call", self.simple_name(function), ctx.symbol)
             elif function.type == "member_access_expression":
                 self.member_ref(function, "call", ctx)
+                self.http_endpoint(node, function, ctx)
         self.visit_children(node, ctx)
+
+    # --- HTTP endpoints -------------------------------------------------------------
+
+    def controller_endpoints(self, node: Node, index: int, name: str, ctx: _Ctx) -> None:
+        """[HttpGet("{id}")] etc. on controller actions, combined with the class [Route]."""
+        attributes = " ".join(self.attributes(node))
+        verbs = _HTTP_ATTRIBUTE.findall(attributes)
+        method_route = _ROUTE_ATTRIBUTE.search(attributes)
+        if not verbs and not (method_route and ctx.route_prefix is not None):
+            return
+        targets = verbs or [("", "")]
+        for verb, template in targets:
+            route = template or (method_route.group(1) if method_route else "")
+            prefix = ctx.route_prefix
+            if prefix is None and not route and ctx.controller:
+                # conventional routing: {controller}/{action}
+                prefix, route = ctx.controller, name
+            full = join_routes(prefix, route, slash_is_absolute=True)
+            full = re.sub(r"\[action\]", name, full, flags=re.IGNORECASE)
+            self.out.endpoints.append(
+                Endpoint(
+                    "server", verb.upper() or None, normalize_route(full), index, self.line(node)
+                )
+            )
+
+    def http_endpoint(self, node: Node, function: Node, ctx: _Ctx) -> None:
+        """Minimal API routes (``MapGet``) and HttpClient calls (``GetFromJsonAsync``)."""
+        if ctx.symbol is None:
+            return
+        method_name = self.simple_name(function.child_by_field_name("name"))
+        arguments = node.child_by_field_name("arguments")
+        args = (
+            [a.named_children[0] for a in arguments.named_children if a.named_children]
+            if (arguments is not None)
+            else []
+        )
+        if not args:
+            return
+        receiver = function.child_by_field_name("expression")
+        if method_name in _MAP_METHODS:
+            pattern = self.string_value(args[0], ctx)
+            if pattern is None:
+                return
+            route = normalize_route(join_routes(self.group_prefix(receiver, ctx), pattern))
+            endpoint = Endpoint(
+                "server", _MAP_METHODS[method_name], route, ctx.symbol, self.line(node)
+            )
+            self.out.endpoints.append(endpoint)
+            if len(args) > 1 and args[1].type == "identifier":
+                self._handlers.append((endpoint, self.text(args[1]), ctx.cls))
+        elif method_name in _CLIENT_METHODS and receiver is not None:
+            receiver_type = self.chain_root_type(receiver, ctx) or ""
+            if not (_CLIENT_RECEIVER.search(self.text(receiver)) or receiver_type == "HttpClient"):
+                return
+            url = self.string_value(args[0], ctx)
+            if not is_url_path(url):
+                return
+            self.out.endpoints.append(
+                Endpoint(
+                    "client",
+                    _CLIENT_METHODS[method_name],
+                    normalize_route(url),
+                    ctx.symbol,
+                    self.line(node),
+                )
+            )
+
+    def group_prefix(self, node: Node | None, ctx: _Ctx) -> str | None:
+        """Route prefix of a MapGroup chain: ``app.MapGroup("api/x").HasApiVersion(1)``."""
+        if node is None:
+            return None
+        if node.type == "identifier":
+            return ctx.groups.get(self.text(node))
+        if node.type != "invocation_expression":
+            return None
+        function = node.child_by_field_name("function")
+        if function is None or function.type != "member_access_expression":
+            return None
+        inner = self.group_prefix(function.child_by_field_name("expression"), ctx)
+        if self.simple_name(function.child_by_field_name("name")) != "MapGroup":
+            return inner
+        arguments = node.child_by_field_name("arguments")
+        first = arguments.named_children[0] if arguments and arguments.named_children else None
+        value = (
+            self.string_value(first.named_children[0], ctx)
+            if first and first.named_children
+            else None
+        )
+        return join_routes(inner, value or "")
+
+    def string_value(self, node: Node | None, ctx: _Ctx) -> str | None:
+        """Best-effort value of a string expression; unknown parts become ``{}``, an
+        unknown *leading* part (a base URL) is dropped."""
+        if node is None:
+            return None
+        if node.type == "string_literal":
+            return "".join(
+                self.text(c) for c in node.named_children if c.type == "string_literal_content"
+            )
+        if node.type == "verbatim_string_literal":
+            return self.text(node)[2:-1]
+        if node.type == "identifier":
+            return ctx.strings.get(self.text(node))
+        if node.type == "interpolated_string_expression":
+            parts: list[str] = []
+            for child in node.named_children:
+                if child.type == "string_content":
+                    parts.append(self.text(child))
+                elif child.type == "interpolation":
+                    inner = next(
+                        (c for c in child.named_children if c.type != "interpolation_brace"), None
+                    )
+                    known = ctx.strings.get(self.text(inner)) if inner is not None else None
+                    if known is not None:
+                        parts.append(known)
+                    elif parts:
+                        parts.append("{}")
+            return "".join(parts)
+        if node.type == "binary_expression":
+            left = self.string_value(node.child_by_field_name("left"), ctx)
+            right = self.string_value(node.child_by_field_name("right"), ctx)
+            if left is None and right is None:
+                return None
+            return (left if left is not None else "") + (right if right is not None else "{}")
+        return None
 
     def on_object_creation_expression(self, node: Node, ctx: _Ctx) -> None:
         type_node = node.child_by_field_name("type")
@@ -362,8 +586,6 @@ class CSharpExtractor(ExtractorBase):
             qualifier=qualifier,
             qualifier_type=self.chain_root_type(expression, ctx),
         )
-        if expression.type not in ("identifier", "this", "base"):
-            self.visit(expression, ctx)
 
     def chain_root_type(self, expression: Node, ctx: _Ctx) -> str | None:
         """Declared type of the first segment of ``a.b.c`` / ``this.a.b``."""

@@ -1,7 +1,13 @@
-"""Resolves references, imports and inheritance of one repository (CONCEPT.md 3.4).
+"""Resolves references, imports and inheritance (CONCEPT.md 3.4, 4.3).
 
-Runs over the whole repository after each index run: symbol IDs of re-indexed
-files change, so references *into* those files must be re-resolved as well.
+Lookup tables cover the whole workspace, so references can cross repository borders:
+TypeScript imports of packages defined in another repository (or another package of
+a monorepo, found via package.json) and C# usings of namespaces from other
+repositories. Only the references of the repositories "in scope" are (re)computed;
+the indexer puts a repository in scope when it changed or when references from it
+pointed into code that was re-indexed. Resolution by name alone (confidence 0.5)
+never crosses repository borders.
+
 Everything is loaded into memory; resolution itself is plain dictionary lookups.
 
 Confidence levels:
@@ -15,6 +21,7 @@ Confidence levels:
 from __future__ import annotations
 
 import json
+import os
 import posixpath
 import re
 from collections import defaultdict
@@ -24,7 +31,7 @@ from pathlib import Path
 from sqlalchemy import Connection, bindparam, delete, insert, select, update
 
 from wingman.extract.model import NAMESPACE_KINDS, TYPE_KINDS
-from wingman.storage.schema import files, imports, refs, symbol_edges, symbols
+from wingman.storage.schema import files, imports, refs, repositories, symbol_edges, symbols
 
 MAX_DEPTH = 6
 TS_EXTENSIONS = (".ts", ".tsx", ".d.ts", ".mts", ".cts")
@@ -85,10 +92,27 @@ class _Import:
 @dataclass
 class _File:
     id: int
+    repo_id: int
     path: str
     language: str
     namespaces: list[str] = field(default_factory=list)
     imports: list[_Import] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _Package:
+    """A package.json somewhere in the workspace."""
+
+    name: str
+    repo_id: int
+    directory: str
+    """Relative to the repository root ('' for the root)."""
+    entries: tuple[str, ...]
+    """Entry points from package.json (source, types, module, main), in that order."""
+
+
+PACKAGE_SKIP_DIRS = frozenset({"node_modules", ".git", "dist", "build", "out", "bin", "obj"})
+BUILD_DIRS = ("dist/", "lib/", "build/", "out/", "esm/", "cjs/")
 
 
 @dataclass(frozen=True)
@@ -105,33 +129,47 @@ class ResolveStats:
     edges: int = 0
 
 
-class RepoResolver:
-    def __init__(self, conn: Connection, repo_id: int, root: Path) -> None:
+class WorkspaceResolver:
+    def __init__(self, conn: Connection, workspace_id: int, scope: set[int]) -> None:
+        """``scope``: ids of the repositories whose references are (re)resolved."""
         self.conn = conn
-        self.repo_id = repo_id
-        self.root = root
-        self._tsconfig_cache: dict[str, tuple[str, dict] | None] = {}
+        self.workspace_id = workspace_id
+        self.scope = scope
+        self._tsconfig_cache: dict[tuple[int, str], tuple[str, dict] | None] = {}
+        self._packages: list[_Package] | None = None
         self._load()
 
     # --- loading ----------------------------------------------------------------
 
     def _load(self) -> None:
         c = self.conn
-        self.files: dict[int, _File] = {}
-        for row in c.execute(
-            select(files.c.id, files.c.path, files.c.language, files.c.namespaces).where(
-                files.c.repo_id == self.repo_id
+        self.roots: dict[int, Path] = {
+            row.id: Path(row.root_path)
+            for row in c.execute(
+                select(repositories.c.id, repositories.c.root_path).where(
+                    repositories.c.workspace_id == self.workspace_id
+                )
             )
-        ):
-            namespaces = row.namespaces
-            if isinstance(namespaces, str):
-                namespaces = json.loads(namespaces)
-            self.files[row.id] = _File(row.id, row.path, row.language or "", namespaces or [])
-        self.path_to_file = {f.path: f.id for f in self.files.values()}
+        }
+        self.files: dict[int, _File] = {}
+        if self.roots:
+            for row in c.execute(
+                select(
+                    files.c.id, files.c.repo_id, files.c.path, files.c.language, files.c.namespaces
+                ).where(files.c.repo_id.in_(list(self.roots)))
+            ):
+                namespaces = row.namespaces
+                if isinstance(namespaces, str):
+                    namespaces = json.loads(namespaces)
+                self.files[row.id] = _File(
+                    row.id, row.repo_id, row.path, row.language or "", namespaces or []
+                )
+        self.path_to_file = {(f.repo_id, f.path): f.id for f in self.files.values()}
         file_ids = list(self.files)
+        self.scope_files = [f.id for f in self.files.values() if f.repo_id in self.scope]
 
         self.symbols: dict[int, _Sym] = {}
-        if file_ids:
+        for chunk in _chunks(file_ids):
             for row in c.execute(
                 select(
                     symbols.c.id,
@@ -142,7 +180,7 @@ class RepoResolver:
                     symbols.c.qualified_name,
                     symbols.c.modifiers,
                     symbols.c.type_name,
-                ).where(symbols.c.file_id.in_(file_ids))
+                ).where(symbols.c.file_id.in_(chunk))
             ):
                 modifiers = row.modifiers
                 if isinstance(modifiers, str):
@@ -175,8 +213,8 @@ class RepoResolver:
             elif sym.kind in CALLABLE_KINDS:
                 self.callables_by_name[sym.name].append(sym.id)
 
-        self.global_usings: list[str] = []
-        if file_ids:
+        self.global_usings: dict[int, list[str]] = defaultdict(list)
+        for chunk in _chunks(file_ids):
             for row in c.execute(
                 select(
                     imports.c.id,
@@ -186,13 +224,29 @@ class RepoResolver:
                     imports.c.alias,
                     imports.c.kind,
                     imports.c.resolved_file_id,
-                ).where(imports.c.file_id.in_(file_ids))
+                ).where(imports.c.file_id.in_(chunk))
             ):
-                self.files[row.file_id].imports.append(_Import(*row))
-                if row.kind == "global_using":
-                    self.global_usings.append(row.module)
+                file = self.files[row.file_id]
+                file.imports.append(_Import(*row))
+                if row.kind == "global_using":  # applies to the whole project/repository
+                    self.global_usings[file.repo_id].append(row.module)
 
+        # Base types of repositories outside the scope come from their stored results.
         self.bases: dict[int, list[int]] = defaultdict(list)
+        outside = [f for f in file_ids if self.files[f].repo_id not in self.scope]
+        for chunk in _chunks(outside):
+            for row in c.execute(
+                select(refs.c.from_symbol_id, refs.c.to_symbol_id).where(
+                    refs.c.from_file_id.in_(chunk),
+                    refs.c.kind.in_(("inherits", "implements")),
+                    refs.c.to_symbol_id.is_not(None),
+                    refs.c.from_symbol_id.is_not(None),
+                )
+            ):
+                self.bases[row.from_symbol_id].append(row.to_symbol_id)
+
+    def repo_of(self, symbol_id: int) -> int:
+        return self.files[self.symbols[symbol_id].file_id].repo_id
 
     # --- entry point ------------------------------------------------------------
 
@@ -200,23 +254,21 @@ class RepoResolver:
         stats = ResolveStats()
         self._resolve_imports()
         ref_rows = []
-        if self.files:
-            ref_rows = list(
-                self.conn.execute(
-                    select(
-                        refs.c.id,
-                        refs.c.from_file_id,
-                        refs.c.from_symbol_id,
-                        refs.c.target_name,
-                        refs.c.qualifier,
-                        refs.c.qualifier_type,
-                        refs.c.kind,
-                        refs.c.to_symbol_id,
-                        refs.c.confidence,
-                        refs.c.resolver,
-                    ).where(refs.c.from_file_id.in_(list(self.files)))
-                )
-            )
+        for chunk in _chunks(self.scope_files):
+            ref_rows += self.conn.execute(
+                select(
+                    refs.c.id,
+                    refs.c.from_file_id,
+                    refs.c.from_symbol_id,
+                    refs.c.target_name,
+                    refs.c.qualifier,
+                    refs.c.qualifier_type,
+                    refs.c.kind,
+                    refs.c.to_symbol_id,
+                    refs.c.confidence,
+                    refs.c.resolver,
+                ).where(refs.c.from_file_id.in_(chunk), refs.c.kind != "http_call")
+            ).all()
         heritage = [r for r in ref_rows if r.kind in ("inherits", "implements")]
         others = [r for r in ref_rows if r.kind not in ("inherits", "implements")]
 
@@ -256,11 +308,12 @@ class RepoResolver:
 
     def _resolve_imports(self) -> None:
         updates = []
-        for file in self.files.values():
+        for file_id in self.scope_files:
+            file = self.files[file_id]
             if file.language != "typescript":
                 continue
             for imp in file.imports:
-                target = self.resolve_module(file.path, imp.module)
+                target = self.resolve_module(file, imp.module)
                 if target != imp.resolved_file_id:
                     updates.append({"imp_id": imp.id, "target": target})
                     imp.resolved_file_id = target
@@ -272,11 +325,16 @@ class RepoResolver:
                 updates,
             )
 
-    def resolve_module(self, from_path: str, spec: str) -> int | None:
+    def resolve_module(self, file: _File, spec: str) -> int | None:
+        """File a TypeScript module specifier points to, in any repository."""
         if spec.startswith("."):
-            base = posixpath.normpath(posixpath.join(posixpath.dirname(from_path), spec))
-            return self._module_file(base)
-        config = self._tsconfig_for(from_path)
+            base = posixpath.normpath(posixpath.join(posixpath.dirname(file.path), spec))
+            return self._module_file(file.repo_id, base)
+        found = self._resolve_tsconfig(file, spec)
+        return found if found is not None else self._resolve_package(spec)
+
+    def _resolve_tsconfig(self, file: _File, spec: str) -> int | None:
+        config = self._tsconfig_for(file)
         if config is None:
             return None
         config_dir, options = config
@@ -294,38 +352,73 @@ class RepoResolver:
             for target in targets:
                 path = target.replace("*", middle)
                 base = posixpath.normpath(posixpath.join(config_dir, base_url or ".", path))
-                found = self._module_file(base)
+                found = self._module_file(file.repo_id, base)
                 if found is not None:
                     return found
         if base_url:
-            return self._module_file(posixpath.normpath(posixpath.join(config_dir, base_url, spec)))
+            base = posixpath.normpath(posixpath.join(config_dir, base_url, spec))
+            return self._module_file(file.repo_id, base)
         return None
 
-    def _module_file(self, base: str) -> int | None:
+    # --- packages (package.json anywhere in the workspace) -------------------------
+
+    def packages(self) -> list[_Package]:
+        if self._packages is None:
+            found = []
+            for repo_id, root in self.roots.items():
+                for directory, dirnames, filenames in os.walk(root):
+                    dirnames[:] = [d for d in dirnames if d not in PACKAGE_SKIP_DIRS]
+                    if "package.json" in filenames:
+                        package = _read_package(repo_id, root, Path(directory))
+                        if package is not None:
+                            found.append(package)
+            # longest names first, so "@acme/shared-ui" wins over "@acme/shared"
+            self._packages = sorted(found, key=lambda p: -len(p.name))
+        return self._packages
+
+    def _resolve_package(self, spec: str) -> int | None:
+        for package in self.packages():
+            if spec == package.name:
+                subpath = ""
+            elif spec.startswith(package.name + "/"):
+                subpath = spec[len(package.name) + 1 :]
+            else:
+                continue
+            for candidate in _package_candidates(package, subpath):
+                found = self._module_file(package.repo_id, candidate)
+                if found is not None:
+                    return found
+        return None
+
+    def _module_file(self, repo_id: int, base: str) -> int | None:
         base = base.removeprefix("./")
         stem = re.sub(r"\.(js|jsx|mjs|cjs)$", "", base)
         candidates = [base, *(stem + ext for ext in TS_EXTENSIONS)]
         candidates += [f"{stem}/index{ext}" for ext in (".ts", ".tsx", ".d.ts")]
         for candidate in candidates:
-            file_id = self.path_to_file.get(candidate)
+            file_id = self.path_to_file.get((repo_id, candidate))
             if file_id is not None:
                 return file_id
         return None
 
-    def _tsconfig_for(self, from_path: str) -> tuple[str, dict] | None:
-        directory = posixpath.dirname(from_path)
+    def _tsconfig_for(self, file: _File) -> tuple[str, dict] | None:
+        directory = posixpath.dirname(file.path)
         while True:
-            if directory not in self._tsconfig_cache:
-                self._tsconfig_cache[directory] = self._read_tsconfig(directory)
-            found = self._tsconfig_cache[directory]
+            key = (file.repo_id, directory)
+            if key not in self._tsconfig_cache:
+                self._tsconfig_cache[key] = self._read_tsconfig(file.repo_id, directory)
+            found = self._tsconfig_cache[key]
             if found is not None:
                 return found
             if directory in ("", "."):
                 return None
             directory = posixpath.dirname(directory)
 
-    def _read_tsconfig(self, directory: str, name: str = "tsconfig.json", depth: int = 0):
-        path = self.root / directory / name if directory not in ("", ".") else self.root / name
+    def _read_tsconfig(
+        self, repo_id: int, directory: str, name: str = "tsconfig.json", depth: int = 0
+    ):
+        root = self.roots[repo_id]
+        path = root / directory / name if directory not in ("", ".") else root / name
         if not path.is_file() or depth > 3:
             return None
         try:
@@ -340,7 +433,7 @@ class RepoResolver:
             if not parent_path.endswith(".json"):
                 parent_path += ".json"
             parent = self._read_tsconfig(
-                posixpath.dirname(parent_path), posixpath.basename(parent_path), depth + 1
+                repo_id, posixpath.dirname(parent_path), posixpath.basename(parent_path), depth + 1
             )
             if parent is not None:
                 parent_dir, parent_options = parent
@@ -434,7 +527,7 @@ class RepoResolver:
             if found is not None:
                 return found
 
-        return self._unique(candidates, 0.5)
+        return self._unique(candidates, 0.5, file.repo_id)
 
     def _resolve_csharp_type(self, name: str, file: _File, candidates: list[int]):
         namespaces = set()
@@ -442,7 +535,7 @@ class RepoResolver:
             parts = ns.split(".")
             namespaces.update(".".join(parts[:i]) for i in range(1, len(parts) + 1))
         usings = {imp.module for imp in file.imports if imp.kind == "using" and not imp.alias}
-        usings.update(self.global_usings)
+        usings.update(self.global_usings.get(file.repo_id, []))
 
         def namespace_of(sid: int) -> str:
             return (
@@ -451,15 +544,21 @@ class RepoResolver:
                 else ""
             )
 
+        def prefer_own_repo(ids: list[int]) -> int:
+            own = [sid for sid in ids if self.repo_of(sid) == file.repo_id]
+            return (own or ids)[0]
+
         in_namespace = [sid for sid in candidates if namespace_of(sid) in namespaces]
         if in_namespace:
-            return Resolution(in_namespace[0], 0.9, "namespace")
+            return Resolution(prefer_own_repo(in_namespace), 0.9, "namespace")
         via_using = [sid for sid in candidates if namespace_of(sid) in usings]
         if via_using:
-            return Resolution(via_using[0], 0.9, "import")
+            return Resolution(prefer_own_repo(via_using), 0.9, "import")
         return None
 
-    def _unique(self, candidates: list[int], confidence: float) -> Resolution | None:
+    def _unique(self, candidates: list[int], confidence: float, repo_id: int) -> Resolution | None:
+        """The only candidate (by qualified name) within ``repo_id``."""
+        candidates = [sid for sid in candidates if self.repo_of(sid) == repo_id]
         qualified = {self.symbols[sid].qualified_name for sid in candidates}
         if len(qualified) == 1:
             return Resolution(candidates[0], confidence, "name")
@@ -569,7 +668,7 @@ class RepoResolver:
 
         if file.language == "typescript" and qualifier.split(".", 1)[0] in TS_GLOBALS:
             return None
-        return self._unique_member(name)
+        return self._unique_member(name, file.repo_id)
 
     def _resolve_bare(self, name: str, file: _File, from_symbol: int | None) -> Resolution | None:
         # nested functions of the enclosing function chain
@@ -596,7 +695,7 @@ class RepoResolver:
                         found = self.find_member(ids[0], name)
                         if found is not None:
                             return Resolution(found[0], 0.9, "import")
-            return self._unique_member(name)
+            return self._unique_member(name, file.repo_id)
 
         # TypeScript
         top = self.top_level.get(file.id, {}).get(name)
@@ -611,9 +710,11 @@ class RepoResolver:
             for sid in self.callables_by_name.get(name, [])
             if self.symbols[sid].parent_id is None
         ]
-        return self._unique(top_level_candidates, 0.5) if top_level_candidates else None
+        if not top_level_candidates:
+            return None
+        return self._unique(top_level_candidates, 0.5, file.repo_id)
 
-    def _unique_member(self, name: str) -> Resolution | None:
+    def _unique_member(self, name: str, repo_id: int) -> Resolution | None:
         """Method/property ``name`` defined in exactly one type of the repository."""
         candidates = [
             sid
@@ -623,14 +724,15 @@ class RepoResolver:
         ]
         if not candidates:
             return None
-        return self._unique(candidates, 0.5)
+        return self._unique(candidates, 0.5, repo_id)
 
     # --- edges --------------------------------------------------------------------
 
     def _rebuild_edges(self, heritage, results) -> int:
-        symbol_ids = list(self.symbols)
-        if symbol_ids:
-            self.conn.execute(delete(symbol_edges).where(symbol_edges.c.src_id.in_(symbol_ids)))
+        scope_files = set(self.scope_files)
+        symbol_ids = [s.id for s in self.symbols.values() if s.file_id in scope_files]
+        for chunk in _chunks(symbol_ids):
+            self.conn.execute(delete(symbol_edges).where(symbol_edges.c.src_id.in_(chunk)))
         edges: dict[tuple[int, int, str], float] = {}
         for row in heritage:
             result = results.get(row.id)
@@ -642,6 +744,11 @@ class RepoResolver:
 
         # overrides: a member with the same name in a base type
         for type_id, bases in self.bases.items():
+            if (
+                self.symbols.get(type_id) is None
+                or self.symbols[type_id].file_id not in scope_files
+            ):
+                continue
             for name, member_ids in self.members.get(type_id, {}).items():
                 for member_id in member_ids:
                     if self.symbols[member_id].kind not in ("method", "property"):
@@ -704,5 +811,51 @@ def _strip_json_comments(text: str) -> str:
     return re.sub(r",(\s*[}\]])", r"\1", "".join(result))
 
 
-def resolve_repository(conn: Connection, repo_id: int, root: Path) -> ResolveStats:
-    return RepoResolver(conn, repo_id, root).run()
+def _chunks(ids: list[int], size: int = 900):
+    """Keep IN lists below SQLite's variable limit."""
+    for start in range(0, len(ids), size):
+        yield ids[start : start + size]
+
+
+def _read_package(repo_id: int, root: Path, directory: Path) -> _Package | None:
+    try:
+        data = json.loads((directory / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    name = data.get("name") if isinstance(data, dict) else None
+    if not isinstance(name, str) or not name:
+        return None
+    entries = [data.get(key) for key in ("source", "types", "typings", "module", "main")]
+    rel = directory.relative_to(root).as_posix()
+    return _Package(
+        name=name,
+        repo_id=repo_id,
+        directory="" if rel == "." else rel,
+        entries=tuple(e for e in entries if isinstance(e, str)),
+    )
+
+
+def _package_candidates(package: _Package, subpath: str) -> list[str]:
+    """Module paths (without extension) to try for an import of a package."""
+
+    def join(*parts: str) -> str:
+        return posixpath.normpath(posixpath.join(*(p for p in parts if p))).removeprefix("./")
+
+    def source_variants(path: str) -> list[str]:
+        path = re.sub(r"(\.d)?\.(ts|tsx|js|jsx|mjs|cjs)$", "", path.removeprefix("./"))
+        variants = [path]
+        for build in BUILD_DIRS:  # dist/index.js was compiled from src/index.ts
+            if path.startswith(build):
+                variants += ["src/" + path[len(build) :], path[len(build) :]]
+        return variants
+
+    if subpath:
+        return [join(package.directory, v) for v in [subpath, "src/" + subpath]]
+    candidates = [v for entry in package.entries for v in source_variants(entry)]
+    candidates += ["src/index", "index", "lib/index"]
+    return [join(package.directory, c) for c in candidates]
+
+
+def resolve_workspace(conn: Connection, workspace_id: int, scope: set[int]) -> ResolveStats:
+    """(Re)resolve the references of the repositories in ``scope``."""
+    return WorkspaceResolver(conn, workspace_id, scope).run()

@@ -8,6 +8,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
 from wingman import __version__, context, notes, render
+from wingman import endpoints as http
 from wingman import query as queries
 from wingman.indexer import IndexingError, index_repository
 from wingman.workspace import Workspace
@@ -18,8 +19,9 @@ docs, tests, notes). Use it before grepping or reading files at random:
 
 - Bug report, stack trace or coding task: call find_relevant_for_task with the full text.
 - Looking for a concept or name: search_code.
-- Navigating: get_symbol, get_callers (includes calls through interfaces/base methods),
-  get_callees, find_tests_for, get_file_outline.
+- Navigating: get_symbol, get_callers (includes calls through interfaces/base methods
+  and HTTP calls from other services/frontends), get_callees, find_tests_for,
+  get_file_outline, list_endpoints.
 - Locations are repo:path:start-end; read exactly those lines.
 - Learned something non-obvious about the code? Store it with add_note.
 - After editing files outside the normal edit tools (e.g. via shell), call reindex.
@@ -158,6 +160,20 @@ def create_server(home: Path | None = None, workspace: Workspace | None = None) 
                 return "Several files match:\n" + "\n".join(f"  {r}:{p}" for _, r, p in matches)
             file_id, repo, rel = matches[0]
             return render.outline(repo, rel, queries.outline(conn, file_id))
+
+    @server.tool(annotations=READ_ONLY)
+    def list_endpoints(route_filter: str | None = None, clients: bool = False) -> str:
+        """HTTP routes served in the workspace with their handler and number of matched
+        client calls (ASP.NET controllers, minimal APIs, NestJS, Express); with
+        ``clients`` the HTTP calls made by the code instead (fetch, axios, HttpClient).
+        get_callers on a handler also shows the client calls."""
+        role = "client" if clients else "server"
+        with ws.engine.connect() as conn:
+            items = http.list_endpoints(
+                conn, ws.workspace_id(conn), role=role, contains=route_filter
+            )
+            hits = queries.get_symbols(conn, [i.symbol_id for i in items])
+        return render.endpoint_list(items, hits, role)
 
     @server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False))
     def add_note(target: str, text: str) -> str:

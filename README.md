@@ -7,10 +7,10 @@ another SQL database.
 
 The full design is in [CONCEPT.md](CONCEPT.md) (German).
 
-> **Status:** Phase 2 – structural index for **TypeScript/TSX and C#** (symbols, docs,
-> imports, call graph, inheritance, full-text search), context packs for bug reports,
-> an MCP server and hooks for Claude Code. Multi-repo linking, embeddings, LLM
-> summaries and external docs follow (see the roadmap in CONCEPT.md).
+> **Status:** structural index for **TypeScript/TSX and C#** (symbols, docs, imports,
+> call graph, inheritance), full-text + semantic search, context packs for bug reports,
+> multi-repo linking (packages, HTTP endpoints), an MCP server and hooks for Claude
+> Code. LLM summaries and external docs follow (see the roadmap in CONCEPT.md).
 
 ## Installation
 
@@ -50,7 +50,7 @@ This registers the MCP server `wingman` (local scope), adds two hooks to
 
 MCP tools: `find_relevant_for_task` (paste a bug report, stack trace or task),
 `search_code`, `get_symbol`, `get_callers`, `get_callees`, `find_tests_for`,
-`get_file_outline`, `add_note`, `reindex`.
+`get_file_outline`, `list_endpoints`, `add_note`, `reindex`.
 
 Use `--shared` to write portable, committable config instead (`.mcp.json` and
 `.claude/settings.json`; requires `wingman` on `PATH` and the workspace in a parent
@@ -72,6 +72,23 @@ wingman tests TaxCalculator.Breakdown     # tests that reach a symbol (up to 3 c
 wingman note add TaxCalculator.Breakdown "Discount is applied before tax (#123)"
 wingman note add backend:src/Api "Controllers must call Audit()"
 wingman reindex src/billing/tax.ts        # single files, e.g. after a git checkout
+```
+
+### Several repositories
+
+All repositories of a workspace are resolved together:
+
+- **Packages**: `import { x } from "@acme/shared"` resolves into the repository (or
+  monorepo package) whose `package.json` is named `@acme/shared`; C# `using`s find
+  namespaces in other repositories.
+- **HTTP**: server routes (ASP.NET controllers and minimal APIs, NestJS, Express) are
+  matched with client calls (`fetch`, `axios`, Angular `HttpClient`, .NET
+  `HttpClient`), so `wingman callers InvoicesController.GetTax` also lists the
+  frontend function that calls `GET /api/invoices/{id}/tax`.
+
+```bash
+wingman endpoints                         # routes, handlers and number of client calls
+wingman endpoints --clients --unmatched   # HTTP calls that match no known route
 ```
 
 ### Semantic search

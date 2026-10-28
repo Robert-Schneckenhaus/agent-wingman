@@ -12,7 +12,7 @@ from wingman.storage.schema import files, refs, repositories, symbol_edges, symb
 from wingman.storage.search import backend_for, query_terms, searchable
 from wingman.storage.store import Note, list_notes
 
-CALL_KINDS = ("call", "instantiate")
+CALL_KINDS = ("call", "instantiate", "http_call")
 MEMBER_KINDS = frozenset({"property", "field", "const"})
 
 

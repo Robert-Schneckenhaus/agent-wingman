@@ -40,6 +40,7 @@ def test_lists_tools_with_annotations(ws, tmp_path):
         "get_callees",
         "find_tests_for",
         "get_file_outline",
+        "list_endpoints",
         "add_note",
         "reindex",
     }
@@ -75,6 +76,13 @@ def test_navigation_tools(call):
     outline = call("get_file_outline", path="ts_app:src/billing/tax.ts")
     assert "class TaxCalculator" in outline
     assert "File not in index" in call("get_file_outline", path="nope.ts")
+
+
+def test_list_endpoints(call):
+    servers = call("list_endpoints", route_filter="invoices")
+    assert "/api/invoices/{}/tax  -> Billing.Api.InvoicesController.GetTax" in servers
+    clients = call("list_endpoints", clients=True)
+    assert "fetchInvoiceTax" in clients
 
 
 def test_add_note_is_shown_on_the_symbol(call):

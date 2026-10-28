@@ -112,7 +112,7 @@ def test_budget_limits(indexed, fake):
 
 
 def test_semantic_search_finds_code_without_shared_words(indexed, fake):
-    query_text = "Rabatt MwSt Rechnung"  # German; no word occurs in the code
+    query_text = "Rabatt MwSt"  # German; no word occurs in the code
     with indexed.engine.connect() as conn:
         assert query.search(conn, indexed.workspace_id, query_text) == []
 
@@ -126,7 +126,7 @@ def test_semantic_search_finds_code_without_shared_words(indexed, fake):
         "Billing.Tax.TaxCalculator",
         "Billing.Tax.TaxCalculator.Breakdown",
     }
-    assert tax_calculator & set(names[:3]), names
+    assert names[0] in tax_calculator, names
     assert all(h.matched_by == "meaning" for h in hits)
 
 

@@ -148,3 +148,9 @@ def test_normalize_xml_doc():
     assert doc == "Uses TaxCalculator & rounds.\nThrows ArgumentException: If empty"
     assert normalize_xml_doc(["// plain comment"]) == "plain comment"
     assert normalize_xml_doc(["/// no tags here"]) == "no tags here"
+
+
+def test_chained_calls_are_visited_once():
+    result = _extract("class C { void M() { app.MapGet().WithName().WithSummary().WithTags(); } }")
+    calls = [r.target_name for r in result.refs if r.kind == "call"]
+    assert sorted(calls) == ["MapGet", "WithName", "WithSummary", "WithTags"]

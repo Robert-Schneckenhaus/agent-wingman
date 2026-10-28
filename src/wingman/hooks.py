@@ -6,7 +6,6 @@ reports them on stderr only.
 
 from __future__ import annotations
 
-import contextlib
 import json
 from pathlib import Path
 
@@ -59,11 +58,12 @@ def session_start(ws: Workspace) -> str:
     with ws.engine.connect() as conn:
         workspace_id = ws.workspace_id(conn)
     if embedder is not None:
-        # bounded, so the session never waits long; the rest follows later
-        with contextlib.suppress(embeddings.EmbeddingError):
+        try:  # bounded, so the session never waits long; the rest follows later
             embeddings.ensure_embeddings(
                 ws.engine, embedder, workspace_id, max_seconds=SESSION_EMBED_SECONDS
             )
+        except embeddings.EmbeddingError as exc:
+            ws.embedding_failed(exc)
     with ws.engine.connect() as conn:
         stats = workspace_stats(conn, workspace_id)
     return (
