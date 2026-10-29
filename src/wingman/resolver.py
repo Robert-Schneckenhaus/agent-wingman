@@ -42,7 +42,8 @@ MODULE_LANGUAGES = ES_MODULE_LANGUAGES | {"python"}
 # Languages with namespaces/packages and using/import directives (C#, Java).
 NAMESPACE_LANGUAGES = frozenset({"csharp", "java", "php"})
 # Languages where members of the own type can be used without ``this.``.
-IMPLICIT_THIS_LANGUAGES = frozenset({"csharp", "java"})
+IMPLICIT_THIS_LANGUAGES = frozenset({"csharp", "java", "cpp", "c"})
+C_LANGUAGES = frozenset({"c", "cpp"})
 PYTHON_SUFFIXES = (".py", "/__init__.py", ".pyi", "/__init__.pyi")
 # Receivers that are runtime globals, never symbols of the repository.
 TS_GLOBALS = frozenset(
@@ -72,7 +73,9 @@ TS_GLOBALS = frozenset(
         "RegExp",
     }
 )
-CALLABLE_KINDS = frozenset({"function", "method", "constructor", "component", "const", "property"})
+CALLABLE_KINDS = frozenset(
+    {"function", "method", "constructor", "component", "const", "property", "macro"}
+)
 
 
 @dataclass
@@ -175,6 +178,7 @@ class WorkspaceResolver:
                 )
         self.path_to_file = {(f.repo_id, f.path): f.id for f in self.files.values()}
         self._python_modules: dict[str, list[int]] | None = None
+        self._includes: dict[str, list[int]] | None = None
         file_ids = list(self.files)
         self.scope_files = [f.id for f in self.files.values() if f.repo_id in self.scope]
 
@@ -212,6 +216,7 @@ class WorkspaceResolver:
         self.types_by_qualified: dict[str, list[int]] = defaultdict(list)
         self.callables_by_name: dict[str, list[int]] = defaultdict(list)
         self.functions_by_qualified: dict[str, list[int]] = defaultdict(list)
+        self.callables_by_qualified: dict[str, list[int]] = defaultdict(list)
         for sym in self.symbols.values():
             parent = self.symbols.get(sym.parent_id) if sym.parent_id else None
             if parent is None or parent.kind in NAMESPACE_KINDS:
@@ -223,7 +228,8 @@ class WorkspaceResolver:
                 self.types_by_qualified[sym.qualified_name].append(sym.id)
             elif sym.kind in CALLABLE_KINDS:
                 self.callables_by_name[sym.name].append(sym.id)
-                if sym.kind == "function":
+                self.callables_by_qualified[sym.qualified_name].append(sym.id)
+                if sym.kind in ("function", "macro"):
                     self.functions_by_qualified[sym.qualified_name].append(sym.id)
 
         self.global_usings: dict[int, list[str]] = defaultdict(list)
@@ -323,10 +329,12 @@ class WorkspaceResolver:
         updates = []
         for file_id in self.scope_files:
             file = self.files[file_id]
-            if file.language not in MODULE_LANGUAGES:
+            if file.language not in MODULE_LANGUAGES | C_LANGUAGES:
                 continue
             for imp in file.imports:
-                if file.language == "python":
+                if file.language in C_LANGUAGES:
+                    target = self.resolve_include(file, imp.module)
+                elif file.language == "python":
                     target = self.resolve_python_import(file, imp)
                 else:
                     target = self.resolve_module(file, imp.module)
@@ -375,6 +383,57 @@ class WorkspaceResolver:
             base = posixpath.normpath(posixpath.join(config_dir, base_url, spec))
             return self._module_file(file.repo_id, base)
         return None
+
+    # --- C/C++ includes ------------------------------------------------------------
+
+    def resolve_include(self, file: _File, include: str) -> int | None:
+        """``#include "x/y.h"``: next to the including file, else any file of the
+        repository (then the workspace) whose path ends with the include path."""
+        local = posixpath.normpath(posixpath.join(posixpath.dirname(file.path), include))
+        found = self.path_to_file.get((file.repo_id, local))
+        if found is not None:
+            return found
+        candidates = self.includes_by_suffix().get(include.lstrip("./"), [])
+        if not candidates:
+            return None
+        own = [f for f in candidates if self.files[f].repo_id == file.repo_id]
+        return min(own or candidates, key=lambda f: (len(self.files[f].path), f))
+
+    def includes_by_suffix(self) -> dict[str, list[int]]:
+        if self._includes is None:
+            index: dict[str, list[int]] = defaultdict(list)
+            for f in self.files.values():
+                if f.language in C_LANGUAGES:
+                    parts = f.path.split("/")
+                    for start in range(len(parts)):
+                        index["/".join(parts[start:])].append(f.id)
+            self._includes = index
+        return self._includes
+
+    def included_files(self, file_id: int, depth: int = 3) -> list[int]:
+        """Files reachable through #include (breadth first, a few levels)."""
+        seen, frontier, result = {file_id}, [file_id], []
+        for _ in range(depth):
+            following = []
+            for current in frontier:
+                for imp in self.files[current].imports:
+                    target = imp.resolved_file_id
+                    if imp.kind == "include" and target is not None and target not in seen:
+                        seen.add(target)
+                        result.append(target)
+                        following.append(target)
+            frontier = following
+        return result
+
+    def prefer_definition(self, sid: int) -> int:
+        """C/C++: a declaration (prototype, member declaration) -> its definition."""
+        sym = self.symbols[sid]
+        if "declaration" not in sym.modifiers:
+            return sid
+        for other in self.callables_by_qualified.get(sym.qualified_name, []):
+            if "declaration" not in self.symbols[other].modifiers:
+                return other
+        return sid
 
     # --- Python modules -------------------------------------------------------------
 
@@ -604,6 +663,11 @@ class WorkspaceResolver:
             found = self._resolve_csharp_type(name, file, candidates)
             if found is not None:
                 return found
+        if file.language in C_LANGUAGES:
+            included = set(self.included_files(file.id))
+            via_include = [sid for sid in candidates if self.symbols[sid].file_id in included]
+            if via_include:
+                return Resolution(via_include[0], 0.9, "import")
 
         return self._unique(candidates, 0.5, file.repo_id)
 
@@ -681,6 +745,14 @@ class WorkspaceResolver:
     # --- references -------------------------------------------------------------
 
     def resolve_ref(self, ref) -> Resolution | None:
+        result = self._resolve_ref(ref)
+        if result is not None and self.files[ref.from_file_id].language in C_LANGUAGES:
+            target = self.prefer_definition(result.target)
+            if target != result.target:
+                result = Resolution(target, result.confidence, result.resolver)
+        return result
+
+    def _resolve_ref(self, ref) -> Resolution | None:
         file = self.files[ref.from_file_id]
         kind, name, qualifier = ref.kind, ref.target_name, ref.qualifier
 
@@ -693,6 +765,12 @@ class WorkspaceResolver:
                 if found is not None:
                     return found
             return self._resolve_bare(name, file, ref.from_symbol_id)
+
+        if file.language in C_LANGUAGES and qualifier not in ("this", "super"):
+            for prefix in self._enclosing_prefixes(ref.from_symbol_id):  # util::round()
+                ids = self.functions_by_qualified.get(f"{prefix}{qualifier}.{name}")
+                if ids:
+                    return Resolution(ids[0], 0.9, "namespace")
 
         own_type = self.enclosing_type(ref.from_symbol_id)
         if qualifier == "this" and own_type is not None:
@@ -763,6 +841,8 @@ class WorkspaceResolver:
 
         if file.language == "php":
             return self._resolve_php_function(name, file)
+        if file.language in C_LANGUAGES:
+            return self._resolve_c_function(name, file, from_symbol)
         if file.language in NAMESPACE_LANGUAGES:
             own_type = self.enclosing_type(from_symbol)
             while own_type is not None:  # also outer types for nested classes
@@ -797,6 +877,47 @@ class WorkspaceResolver:
         if not top_level_candidates:
             return None
         return self._unique(top_level_candidates, 0.5, file.repo_id)
+
+    def _enclosing_prefixes(self, symbol_id: int | None) -> list[str]:
+        """``a.b.C.m`` -> ``["a.b.C.", "a.b.", "a.", ""]`` (innermost scope first)."""
+        sym = self.symbols.get(symbol_id) if symbol_id is not None else None
+        parts = sym.qualified_name.split(".")[:-1] if sym is not None else []
+        return [".".join(parts[:i]) + "." for i in range(len(parts), 0, -1)] + [""]
+
+    def _resolve_c_function(
+        self, name: str, file: _File, from_symbol: int | None
+    ) -> Resolution | None:
+        """C/C++ bare calls: members of the enclosing class (and bases), functions of the
+        enclosing namespaces, of the file, of included headers, else a unique function."""
+        own_type = self.enclosing_type(from_symbol)
+        if own_type is not None:
+            found = self.find_member(own_type, name)
+            if found is not None:
+                return Resolution(
+                    found[0], 0.8 if found[1] else 1.0, "inherited" if found[1] else "local"
+                )
+        for prefix in self._enclosing_prefixes(from_symbol)[:-1]:
+            ids = self.functions_by_qualified.get(prefix + name)
+            if ids:
+                return Resolution(ids[0], 0.9, "namespace")
+        top = [
+            sid
+            for sid in self.top_level.get(file.id, {}).get(name, [])
+            if self.symbols[sid].kind in ("function", "macro")
+        ]
+        if top:
+            return Resolution(top[0], 1.0, "local")
+        included = set(self.included_files(file.id))
+        candidates = self.functions_by_qualified.get(name, [])
+        via_include = [sid for sid in candidates if self.symbols[sid].file_id in included]
+        if via_include:
+            return Resolution(via_include[0], 0.9, "import")
+        definitions = {self.prefer_definition(sid) for sid in candidates}
+        if len(definitions) == 1:
+            sid = definitions.pop()
+            if self.repo_of(sid) == file.repo_id:
+                return Resolution(sid, 0.5, "name")
+        return None
 
     def _resolve_php_function(self, name: str, file: _File) -> Resolution | None:
         """PHP: bare calls are functions: imported (``use function``), qualified, in the

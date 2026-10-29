@@ -65,6 +65,18 @@ def _php():
     return tree_sitter_php.language_php()
 
 
+def _c():
+    import tree_sitter_c
+
+    return tree_sitter_c.language()
+
+
+def _cpp():
+    import tree_sitter_cpp
+
+    return tree_sitter_cpp.language()
+
+
 _TS = LanguageSpec("typescript", _ts, "typescript")
 _TSX = LanguageSpec("typescript", _tsx, "typescript")
 # JavaScript is parsed with the TSX grammar (a superset that also covers JSX), so the
@@ -74,6 +86,9 @@ _CS = LanguageSpec("csharp", _csharp, "csharp")
 _PY = LanguageSpec("python", _python, "python")
 _JAVA = LanguageSpec("java", _java, "java")
 _PHP = LanguageSpec("php", _php, "php")
+_C = LanguageSpec("c", _c, "cpp")
+# Headers are parsed as C++, which also covers plain C declarations.
+_CPP = LanguageSpec("cpp", _cpp, "cpp")
 
 EXTENSIONS: dict[str, LanguageSpec] = {
     ".ts": _TS,
@@ -89,6 +104,16 @@ EXTENSIONS: dict[str, LanguageSpec] = {
     ".pyi": _PY,
     ".java": _JAVA,
     ".php": _PHP,
+    ".c": _C,
+    ".h": _CPP,
+    ".cc": _CPP,
+    ".cpp": _CPP,
+    ".cxx": _CPP,
+    ".c++": _CPP,
+    ".hh": _CPP,
+    ".hpp": _CPP,
+    ".hxx": _CPP,
+    ".ipp": _CPP,
 }
 
 
@@ -116,6 +141,10 @@ def _extractor(name: str):
         from wingman.extract.typescript import TypeScriptExtractor
 
         return TypeScriptExtractor
+    if name == "cpp":
+        from wingman.extract.cpp import CppExtractor
+
+        return CppExtractor
     if name == "php":
         from wingman.extract.php import PhpExtractor
 
