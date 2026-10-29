@@ -47,12 +47,19 @@ def _csharp():
     return tree_sitter_c_sharp.language()
 
 
+def _python():
+    import tree_sitter_python
+
+    return tree_sitter_python.language()
+
+
 _TS = LanguageSpec("typescript", _ts, "typescript")
 _TSX = LanguageSpec("typescript", _tsx, "typescript")
 # JavaScript is parsed with the TSX grammar (a superset that also covers JSX), so the
 # TypeScript extractor handles both.
 _JS = LanguageSpec("javascript", _tsx, "typescript")
 _CS = LanguageSpec("csharp", _csharp, "csharp")
+_PY = LanguageSpec("python", _python, "python")
 
 EXTENSIONS: dict[str, LanguageSpec] = {
     ".ts": _TS,
@@ -64,6 +71,8 @@ EXTENSIONS: dict[str, LanguageSpec] = {
     ".mjs": _JS,
     ".cjs": _JS,
     ".cs": _CS,
+    ".py": _PY,
+    ".pyi": _PY,
 }
 
 
@@ -82,10 +91,19 @@ def extract(path: str, source: bytes) -> Extraction:
     if spec is None:
         raise ValueError(f"Unsupported file type: {path}")
     tree = _parser(spec).parse(source)
-    if spec.extractor == "typescript":
+    return _extractor(spec.extractor)(source).extract(tree.root_node)
+
+
+@cache
+def _extractor(name: str):
+    if name == "typescript":
         from wingman.extract.typescript import TypeScriptExtractor
 
-        return TypeScriptExtractor(source).extract(tree.root_node)
+        return TypeScriptExtractor
+    if name == "python":
+        from wingman.extract.python import PythonExtractor
+
+        return PythonExtractor
     from wingman.extract.csharp import CSharpExtractor
 
-    return CSharpExtractor(source).extract(tree.root_node)
+    return CSharpExtractor

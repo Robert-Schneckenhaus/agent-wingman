@@ -37,6 +37,9 @@ MAX_DEPTH = 6
 TS_EXTENSIONS = (".ts", ".tsx", ".d.ts", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
 # Languages whose imports bind local names to exports of other files (ES modules).
 ES_MODULE_LANGUAGES = frozenset({"typescript", "javascript"})
+# Languages where imports bind names of other modules (ES modules, Python).
+MODULE_LANGUAGES = ES_MODULE_LANGUAGES | {"python"}
+PYTHON_SUFFIXES = (".py", "/__init__.py", ".pyi", "/__init__.pyi")
 # Receivers that are runtime globals, never symbols of the repository.
 TS_GLOBALS = frozenset(
     {
@@ -167,6 +170,7 @@ class WorkspaceResolver:
                     row.id, row.repo_id, row.path, row.language or "", namespaces or []
                 )
         self.path_to_file = {(f.repo_id, f.path): f.id for f in self.files.values()}
+        self._python_modules: dict[str, list[int]] | None = None
         file_ids = list(self.files)
         self.scope_files = [f.id for f in self.files.values() if f.repo_id in self.scope]
 
@@ -312,10 +316,13 @@ class WorkspaceResolver:
         updates = []
         for file_id in self.scope_files:
             file = self.files[file_id]
-            if file.language not in ES_MODULE_LANGUAGES:
+            if file.language not in MODULE_LANGUAGES:
                 continue
             for imp in file.imports:
-                target = self.resolve_module(file, imp.module)
+                if file.language == "python":
+                    target = self.resolve_python_import(file, imp)
+                else:
+                    target = self.resolve_module(file, imp.module)
                 if target != imp.resolved_file_id:
                     updates.append({"imp_id": imp.id, "target": target})
                     imp.resolved_file_id = target
@@ -361,6 +368,59 @@ class WorkspaceResolver:
             base = posixpath.normpath(posixpath.join(config_dir, base_url, spec))
             return self._module_file(file.repo_id, base)
         return None
+
+    # --- Python modules -------------------------------------------------------------
+
+    def resolve_python_import(self, file: _File, imp) -> int | None:
+        """``from pkg import mod`` may name a submodule; otherwise the module itself."""
+        if imp.imported_name not in (None, "*"):
+            joiner = "" if imp.module.endswith(".") else "."  # "from . import mod"
+            submodule = self.python_module(file, f"{imp.module}{joiner}{imp.imported_name}")
+            if submodule is not None:
+                return submodule
+        return self.python_module(file, imp.module)
+
+    def python_module(self, file: _File, module: str) -> int | None:
+        level = len(module) - len(module.lstrip("."))
+        name = module.lstrip(".")
+        if level:
+            base = posixpath.dirname(file.path)
+            for _ in range(level - 1):
+                base = posixpath.dirname(base)
+            rel = "/".join(p for p in (base, name.replace(".", "/")) if p)
+            for suffix in PYTHON_SUFFIXES:
+                found = self.path_to_file.get((file.repo_id, rel + suffix))
+                if found is not None:
+                    return found
+            return None
+        candidates = self.python_modules().get(name, [])
+        if not candidates:
+            return None
+        own = [f for f in candidates if self.files[f].repo_id == file.repo_id]
+        return min(own or candidates, key=lambda f: (len(self.files[f].path), f))
+
+    def python_modules(self) -> dict[str, list[int]]:
+        """Dotted module name (and every shorter suffix, for source roots such as
+        ``src/``) -> Python files."""
+        if self._python_modules is None:
+            index: dict[str, list[int]] = defaultdict(list)
+            for f in self.files.values():
+                if f.language != "python":
+                    continue
+                stem = re.sub(r"(/__init__)?\.pyi?$", "", f.path)
+                parts = stem.split("/")
+                for start in range(len(parts)):
+                    index[".".join(parts[start:])].append(f.id)
+            self._python_modules = index
+        return self._python_modules
+
+    def _is_module_import(self, imp) -> bool:
+        """``from pkg import mod`` that resolved to the submodule ``mod``."""
+        if imp.resolved_file_id is None or imp.imported_name in (None, "*"):
+            return False
+        path = self.files[imp.resolved_file_id].path
+        stem = re.sub(r"(/__init__)?\.pyi?$", "", path)
+        return stem.rsplit("/", 1)[-1] == imp.imported_name
 
     # --- packages (package.json anywhere in the workspace) -------------------------
 
@@ -463,7 +523,16 @@ class WorkspaceResolver:
                         return sid
         elif top.get(name):
             return top[name][0]
+        is_python = self.files[file_id].language == "python"
         for imp in self.files[file_id].imports:
+            if is_python and imp.kind == "import" and (imp.alias or imp.imported_name) == name:
+                # Python: every imported name is also an attribute of the module
+                if imp.imported_name == "*" or self._is_module_import(imp):
+                    continue
+                found = self.find_export(imp.resolved_file_id, imp.imported_name, depth + 1)
+                if found is not None:
+                    return found
+                continue
             if imp.kind != "reexport":
                 continue
             if imp.imported_name == "*":
@@ -497,7 +566,7 @@ class WorkspaceResolver:
         file = self.files[file_id]
         candidates = self.types_by_name.get(name, [])
 
-        if file.language in ES_MODULE_LANGUAGES:  # imports may rename (aliases, re-exports)
+        if file.language in MODULE_LANGUAGES:  # imports may rename (aliases, re-exports)
             imp = self._import_for_local(file, name)
             if imp is not None:
                 target = self.find_export(imp.resolved_file_id, imp.imported_name or name)
@@ -651,12 +720,16 @@ class WorkspaceResolver:
             if found is not None:
                 return Resolution(found[0], 0.8, "typed")
 
-        if file.language in ES_MODULE_LANGUAGES and re.fullmatch(r"[A-Za-z_$][\w$]*", qualifier):
+        if file.language in MODULE_LANGUAGES and re.fullmatch(r"[A-Za-z_$][\w$.]*", qualifier):
             imp = self._import_for_local(file, qualifier)
-            if imp is not None and imp.imported_name == "*":
+            if imp is not None and (imp.imported_name == "*" or self._is_module_import(imp)):
                 target = self.find_export(imp.resolved_file_id, name)
                 if target is not None:
                     return Resolution(target, 0.9, "import")
+            if file.language == "python":
+                root = self._import_for_local(file, qualifier.split(".", 1)[0])
+                if imp is not None or root is not None:
+                    return None  # a module or name from outside the index (os, json, ...)
 
         if re.fullmatch(r"[A-Z][\w$]*", qualifier):
             owner = self.resolve_type(qualifier, file.id, ref.from_symbol_id)
