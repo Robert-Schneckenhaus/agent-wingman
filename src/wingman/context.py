@@ -230,6 +230,7 @@ def find_relevant(
     scores = _Scores()
     unknown_paths: list[str] = []
     mentioned_files: list[str] = []
+    frame_repos: set[str] = set()
 
     # 1. stack frames: the innermost symbol at the reported line. If the frame also names
     #    the method and that name differs, the trace comes from an older build: trust the
@@ -249,11 +250,13 @@ def find_relevant(
                     scores.add(hit, weight * 0.3, reason + " (line moved?)")
                 else:
                     scores.add(hit, weight, reason)
+                    frame_repos.add(hit.repo)
                     found = True
         if not found and method:
             lookup = query.resolve_name(conn, workspace_id, method)
             for hit in lookup.found[:3]:
                 scores.add(hit, weight * 0.9, f"stack frame {hit.name}")
+                frame_repos.add(hit.repo)
                 found = True
         if not found and frame.path:
             unknown_paths.append(frame.path)
@@ -293,7 +296,10 @@ def find_relevant(
                 "meaning": "similar meaning",
                 "text+meaning": "text match + similar meaning",
             }.get(hit.matched_by or "", "text match")
-            scores.add(hit, 4.0 * (hit.score or 0.0) / best, reason)
+            weight = 4.0 * (hit.score or 0.0) / best
+            if frame_repos and hit.repo not in frame_repos:
+                weight *= 0.4  # a stack trace tells which repositories failed
+            scores.add(hit, weight, reason)
 
     mentions_tests = bool(re.search(r"\btests?\b|\bspec\b", text, re.IGNORECASE))
     for symbol_id, hit in scores.hits.items():

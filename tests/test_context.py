@@ -98,3 +98,17 @@ def test_render_pack_respects_budget(indexed):
 def test_render_pack_without_results(indexed):
     pack, _ = _ranked(indexed, "zzzz qqqq")
     assert "Nothing matched" in context.render_pack(pack)
+
+
+def test_text_matches_outside_the_failing_repositories_rank_lower(indexed):
+    prose = "Money values are formatted wrong for display.\n"
+    frame = (
+        "   at Billing.Tax.TaxCalculator.Breakdown(Invoice invoice) in "
+        "D:\\ci\\work\\Billing\\TaxCalculator.cs:line 22\n"
+    )
+
+    def score(text):
+        pack, _ = _ranked(indexed, text, limit=20)
+        return next(e.score for e in pack.entries if e.hit.name == "formatMoney")
+
+    assert score(prose + frame) < 0.5 * score(prose)

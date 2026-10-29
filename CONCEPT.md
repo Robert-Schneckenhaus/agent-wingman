@@ -579,7 +579,7 @@ Der Prototyp ist auf **einen Entwickler mit lokaler SQLite-DB** ausgelegt. Das D
 ### Todo – für später vorgemerkt
 
 - [ ] **Mehrsprachige Bug-Reports:** Das Standardmodell `bge-small-en-v1.5` findet deutsche Anfragen praktisch nicht (Messung in Abschnitt 9). Idee: ein zweites, mehrsprachiges Modell (z. B. `paraphrase-multilingual-MiniLM-L12-v2`) parallel einbetten und nur für nicht-englische Anfragen nutzen. Der Vektor-Cache ist schon nach Modell getrennt. Kosten: doppelte Einbettzeit. Erst angehen, wenn nicht-englische Reports gebraucht werden.
-- [ ] **Rauschen bei Stacktraces:** Semantische Treffer aus Repos, die in keinem Frame vorkommen (z. B. `InvalidDecoratorItemException` aus nest bei einem eShop-Stacktrace), könnten abgewertet werden.
+- [x] **Rauschen bei Stacktraces:** Semantische Treffer aus Repos, die in keinem Frame vorkommen (z. B. `InvalidDecoratorItemException` aus nest bei einem eShop-Stacktrace), könnten abgewertet werden. *Erledigt:* Text- und Bedeutungstreffer aus Repos ohne Stack-Frame zählen nur noch 40 %; im eShop-Beispiel ist der nest-Treffer aus den Top 8 verschwunden.
 - [ ] **Summaries mit echter API messen:** Qualität und tatsächliche Kosten mit `claude-haiku-5-5` auf eShop prüfen (braucht einen API-Key).
 - [ ] **Datei- und Modul-Summaries** aus den Symbol-Summaries aggregieren (Abschnitt 3.5).
 - [ ] **Batches-API für große Erstläufe:** halber Preis, dafür asynchron (Minuten bis Stunden).
