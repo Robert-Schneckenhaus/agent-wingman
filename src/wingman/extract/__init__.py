@@ -53,6 +53,12 @@ def _python():
     return tree_sitter_python.language()
 
 
+def _java():
+    import tree_sitter_java
+
+    return tree_sitter_java.language()
+
+
 _TS = LanguageSpec("typescript", _ts, "typescript")
 _TSX = LanguageSpec("typescript", _tsx, "typescript")
 # JavaScript is parsed with the TSX grammar (a superset that also covers JSX), so the
@@ -60,6 +66,7 @@ _TSX = LanguageSpec("typescript", _tsx, "typescript")
 _JS = LanguageSpec("javascript", _tsx, "typescript")
 _CS = LanguageSpec("csharp", _csharp, "csharp")
 _PY = LanguageSpec("python", _python, "python")
+_JAVA = LanguageSpec("java", _java, "java")
 
 EXTENSIONS: dict[str, LanguageSpec] = {
     ".ts": _TS,
@@ -73,6 +80,7 @@ EXTENSIONS: dict[str, LanguageSpec] = {
     ".cs": _CS,
     ".py": _PY,
     ".pyi": _PY,
+    ".java": _JAVA,
 }
 
 
@@ -100,6 +108,10 @@ def _extractor(name: str):
         from wingman.extract.typescript import TypeScriptExtractor
 
         return TypeScriptExtractor
+    if name == "java":
+        from wingman.extract.java import JavaExtractor
+
+        return JavaExtractor
     if name == "python":
         from wingman.extract.python import PythonExtractor
 

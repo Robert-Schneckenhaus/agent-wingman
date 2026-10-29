@@ -39,6 +39,8 @@ TS_EXTENSIONS = (".ts", ".tsx", ".d.ts", ".mts", ".cts", ".js", ".jsx", ".mjs", 
 ES_MODULE_LANGUAGES = frozenset({"typescript", "javascript"})
 # Languages where imports bind names of other modules (ES modules, Python).
 MODULE_LANGUAGES = ES_MODULE_LANGUAGES | {"python"}
+# Languages with namespaces/packages and using/import directives (C#, Java).
+NAMESPACE_LANGUAGES = frozenset({"csharp", "java"})
 PYTHON_SUFFIXES = (".py", "/__init__.py", ".pyi", "/__init__.pyi")
 # Receivers that are runtime globals, never symbols of the repository.
 TS_GLOBALS = frozenset(
@@ -572,7 +574,7 @@ class WorkspaceResolver:
                 target = self.find_export(imp.resolved_file_id, imp.imported_name or name)
                 if target is not None:
                     return Resolution(target, 0.9, "import")
-        elif file.language == "csharp":
+        elif file.language in NAMESPACE_LANGUAGES:
             for imp in file.imports:
                 if imp.alias == name:
                     ids = self.types_by_qualified.get(imp.module)
@@ -593,7 +595,7 @@ class WorkspaceResolver:
         if same_file:
             return Resolution(same_file[0], 1.0, "local")
 
-        if file.language == "csharp":
+        if file.language in NAMESPACE_LANGUAGES:
             found = self._resolve_csharp_type(name, file, candidates)
             if found is not None:
                 return found
@@ -712,7 +714,7 @@ class WorkspaceResolver:
         elif (
             segments
             and own_type is not None
-            and (qualifier.startswith("this.") or file.language == "csharp")
+            and (qualifier.startswith("this.") or file.language in NAMESPACE_LANGUAGES)
         ):
             # implicit `this`: the chain starts with a member of the enclosing type
             target_type = self._walk_chain(own_type, segments)
@@ -754,7 +756,7 @@ class WorkspaceResolver:
                 return Resolution(ids[0], 1.0, "local")
             current = self.symbols.get(current.parent_id) if current.parent_id else None
 
-        if file.language == "csharp":
+        if file.language in NAMESPACE_LANGUAGES:
             own_type = self.enclosing_type(from_symbol)
             while own_type is not None:  # also outer types for nested classes
                 found = self.find_member(own_type, name)
