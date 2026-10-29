@@ -34,7 +34,9 @@ from wingman.extract.model import NAMESPACE_KINDS, TYPE_KINDS
 from wingman.storage.schema import files, imports, refs, repositories, symbol_edges, symbols
 
 MAX_DEPTH = 6
-TS_EXTENSIONS = (".ts", ".tsx", ".d.ts", ".mts", ".cts")
+TS_EXTENSIONS = (".ts", ".tsx", ".d.ts", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
+# Languages whose imports bind local names to exports of other files (ES modules).
+ES_MODULE_LANGUAGES = frozenset({"typescript", "javascript"})
 # Receivers that are runtime globals, never symbols of the repository.
 TS_GLOBALS = frozenset(
     {
@@ -310,7 +312,7 @@ class WorkspaceResolver:
         updates = []
         for file_id in self.scope_files:
             file = self.files[file_id]
-            if file.language != "typescript":
+            if file.language not in ES_MODULE_LANGUAGES:
                 continue
             for imp in file.imports:
                 target = self.resolve_module(file, imp.module)
@@ -394,7 +396,7 @@ class WorkspaceResolver:
         base = base.removeprefix("./")
         stem = re.sub(r"\.(js|jsx|mjs|cjs)$", "", base)
         candidates = [base, *(stem + ext for ext in TS_EXTENSIONS)]
-        candidates += [f"{stem}/index{ext}" for ext in (".ts", ".tsx", ".d.ts")]
+        candidates += [f"{stem}/index{ext}" for ext in (".ts", ".tsx", ".d.ts", ".js", ".jsx")]
         for candidate in candidates:
             file_id = self.path_to_file.get((repo_id, candidate))
             if file_id is not None:
@@ -495,7 +497,7 @@ class WorkspaceResolver:
         file = self.files[file_id]
         candidates = self.types_by_name.get(name, [])
 
-        if file.language == "typescript":  # imports may rename (aliases, re-exports)
+        if file.language in ES_MODULE_LANGUAGES:  # imports may rename (aliases, re-exports)
             imp = self._import_for_local(file, name)
             if imp is not None:
                 target = self.find_export(imp.resolved_file_id, imp.imported_name or name)
@@ -649,7 +651,7 @@ class WorkspaceResolver:
             if found is not None:
                 return Resolution(found[0], 0.8, "typed")
 
-        if file.language == "typescript" and re.fullmatch(r"[A-Za-z_$][\w$]*", qualifier):
+        if file.language in ES_MODULE_LANGUAGES and re.fullmatch(r"[A-Za-z_$][\w$]*", qualifier):
             imp = self._import_for_local(file, qualifier)
             if imp is not None and imp.imported_name == "*":
                 target = self.find_export(imp.resolved_file_id, name)
@@ -666,7 +668,7 @@ class WorkspaceResolver:
             if not is_own_member:  # an external type such as Math or Console
                 return None
 
-        if file.language == "typescript" and qualifier.split(".", 1)[0] in TS_GLOBALS:
+        if file.language in ES_MODULE_LANGUAGES and qualifier.split(".", 1)[0] in TS_GLOBALS:
             return None
         return self._unique_member(name, file.repo_id)
 

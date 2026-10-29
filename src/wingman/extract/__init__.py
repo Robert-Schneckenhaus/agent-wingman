@@ -13,7 +13,7 @@ from wingman.extract.model import Extraction
 
 # Bump when extractors (or the indexer) change what they produce: it is part of every
 # file's content hash, so the next `wingman index` re-parses all files.
-EXTRACTOR_VERSION = "6"
+EXTRACTOR_VERSION = "7"
 
 
 def content_hash(data: bytes) -> str:
@@ -49,6 +49,9 @@ def _csharp():
 
 _TS = LanguageSpec("typescript", _ts, "typescript")
 _TSX = LanguageSpec("typescript", _tsx, "typescript")
+# JavaScript is parsed with the TSX grammar (a superset that also covers JSX), so the
+# TypeScript extractor handles both.
+_JS = LanguageSpec("javascript", _tsx, "typescript")
 _CS = LanguageSpec("csharp", _csharp, "csharp")
 
 EXTENSIONS: dict[str, LanguageSpec] = {
@@ -56,6 +59,10 @@ EXTENSIONS: dict[str, LanguageSpec] = {
     ".mts": _TS,
     ".cts": _TS,
     ".tsx": _TSX,
+    ".js": _JS,
+    ".jsx": _JS,
+    ".mjs": _JS,
+    ".cjs": _JS,
     ".cs": _CS,
 }
 

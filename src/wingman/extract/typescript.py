@@ -400,6 +400,8 @@ class TypeScriptExtractor(ExtractorBase):
                 continue
             name_node = declarator.child_by_field_name("name")
             value = declarator.child_by_field_name("value")
+            if self.require_import(name_node, value):
+                continue
             name = self.text(name_node)
             text_value = self.string_value(value)
             if text_value is not None and name_node is not None:
@@ -444,6 +446,29 @@ class TypeScriptExtractor(ExtractorBase):
                 self.function_body(value, ctx, index)
             else:
                 self.visit_children(declarator, replace(ctx, symbol=index))
+
+    def require_import(self, name_node: Node | None, value: Node | None) -> bool:
+        """CommonJS: ``const x = require("m")`` / ``const { a, b: c } = require("m")``."""
+        if name_node is None or value is None or value.type != "call_expression":
+            return False
+        if self.text(value.child_by_field_name("function")) != "require":
+            return False
+        args = value.child_by_field_name("arguments")
+        module = self.string_value(args.named_children[0]) if args and args.named_children else None
+        if not module:
+            return False
+        line = self.line(value)
+        if name_node.type == "identifier":
+            self.out.imports.append(Import(module, line, "*", self.text(name_node)))
+        elif name_node.type == "object_pattern":
+            for part in name_node.named_children:
+                if part.type == "shorthand_property_identifier_pattern":
+                    self.out.imports.append(Import(module, line, self.text(part)))
+                elif part.type == "pair_pattern":
+                    key = self.text(part.child_by_field_name("key"))
+                    alias = self.text(part.child_by_field_name("value"))
+                    self.out.imports.append(Import(module, line, key, alias))
+        return True
 
     def namespace(self, node: Node, ctx: _Ctx, *, modifiers=(), decorators=(), doc=None):
         name = self.text(node.child_by_field_name("name")).strip("'\"")

@@ -4,12 +4,13 @@ from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
-from sqlalchemy import Engine
+from sqlalchemy import Engine, select
 
 from wingman.cli import main
 from wingman.config import ENV_DB, ENV_EMBEDDINGS, ENV_HOME
 from wingman.indexer import index_repository
 from wingman.storage import db, store
+from wingman.storage.schema import refs, symbols
 
 FIXTURES = Path(__file__).parent / "fixtures"
 REPOS = ("ts_app", "cs_app", "shared_lib")
@@ -43,21 +44,45 @@ class IndexedWorkspace:
     def reindex(self, name: str, **kwargs):
         return index_repository(self.engine, self.repo(name), **kwargs)
 
+    def calls(self, kinds=("call", "instantiate")) -> dict[tuple[str, str], str | None]:
+        """``(caller qualified name, target name) -> resolved qualified name or None``."""
+        source, target = symbols.alias("source"), symbols.alias("target")
+        query = (
+            select(source.c.qualified_name, refs.c.target_name, target.c.qualified_name)
+            .select_from(refs)
+            .join(source, source.c.id == refs.c.from_symbol_id)
+            .outerjoin(target, target.c.id == refs.c.to_symbol_id)
+            .where(refs.c.kind.in_(kinds))
+        )
+        with self.engine.connect() as conn:
+            return {(r[0], r[1]): r[2] for r in conn.execute(query)}
 
-@pytest.fixture
-def indexed(tmp_path) -> IndexedWorkspace:
-    """All fixture repositories copied to a temp dir and indexed into a fresh DB."""
+    def symbols(self) -> dict[str, tuple[str, str | None]]:
+        """``qualified name -> (kind, doc)``."""
+        with self.engine.connect() as conn:
+            rows = conn.execute(select(symbols.c.qualified_name, symbols.c.kind, symbols.c.doc))
+            return {r[0]: (r[1], r[2]) for r in rows}
+
+
+def index_fixtures(tmp_path: Path, names) -> IndexedWorkspace:
+    """Copy fixture repositories to ``tmp_path`` and index them into a fresh DB."""
     engine = db.create_db_engine(f"sqlite:///{tmp_path / 'index.db'}")
     db.upgrade(engine)
     with engine.begin() as conn:
         workspace_id = store.ensure_workspace(conn, "test")
-        for name in REPOS:
+        for name in names:
             shutil.copytree(FIXTURES / name, tmp_path / name)
             store.add_repository(conn, workspace_id, name, (tmp_path / name).as_posix())
     workspace = IndexedWorkspace(engine, workspace_id, tmp_path)
-    for name in REPOS:
+    for name in names:
         workspace.reindex(name)
     return workspace
+
+
+@pytest.fixture
+def indexed(tmp_path) -> IndexedWorkspace:
+    """All fixture repositories copied to a temp dir and indexed into a fresh DB."""
+    return index_fixtures(tmp_path, REPOS)
 
 
 @pytest.fixture
