@@ -66,6 +66,11 @@ repositories = Table(
     Column("root_path", Text, nullable=False),
     Column("remote_url", Text),
     Column("last_commit", String(64), comment="Last indexed git commit"),
+    Column(
+        "index_state",
+        JSON,
+        comment="Scan rules and files that differed from last_commit at the last index run",
+    ),
     _created_at(),
     Column("updated_at", DateTime(timezone=True)),
     UniqueConstraint("workspace_id", "name"),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import subprocess
@@ -12,7 +13,7 @@ from pathlib import Path
 import pathspec
 
 from wingman import git
-from wingman.extract import spec_for
+from wingman.extract import EXTENSIONS, EXTRACTOR_VERSION, spec_for
 
 IGNORE_FILE = ".wingmanignore"
 MAX_FILE_BYTES = 1_000_000
@@ -166,3 +167,69 @@ def scan(root: Path) -> list[SourceFile]:
 
     found = (_source(root, rel, ignore) for rel in candidates)
     return sorted((f for f in found if f is not None), key=lambda f: f.path)
+
+
+# --- change detection via git ---------------------------------------------------------
+
+
+def rules_hash(root: Path) -> str:
+    """Everything besides file contents that decides what gets indexed and how: if it
+    changes, the next run scans all files instead of asking git what changed."""
+    ignore_file = root / IGNORE_FILE
+    parts = [
+        EXTRACTOR_VERSION,
+        ",".join(sorted(EXTENSIONS)),
+        "\n".join(DEFAULT_EXCLUDES),
+        str(MAX_FILE_BYTES),
+        ignore_file.read_text(encoding="utf-8") if ignore_file.is_file() else "",
+    ]
+    return hashlib.sha256("\0".join(parts).encode()).hexdigest()[:16]
+
+
+def _git_paths(root: Path, *args: str) -> list[str] | None:
+    try:
+        result = subprocess.run(["git", "-C", str(root), *args], capture_output=True, check=False)
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return [p for p in result.stdout.decode("utf-8", errors="replace").split("\0") if p]
+
+
+def git_dirty(root: Path) -> list[str] | None:
+    """Paths (relative to ``root``) that differ from HEAD: modified, staged, deleted or
+    untracked-but-not-ignored. None outside git."""
+    root = root.resolve()
+    top = git.toplevel(root)
+    if top is None:
+        return None
+    entries = _git_paths(
+        root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--", "."
+    )
+    if entries is None:
+        return None
+    prefix = root.relative_to(top).as_posix()
+    prefix = "" if prefix == "." else prefix + "/"
+    paths = []
+    for entry in entries:
+        path = entry[3:]  # "XY path", relative to the top level of the git repository
+        if path.startswith(prefix):
+            paths.append(path[len(prefix) :])
+    return paths
+
+
+def git_changed_since(root: Path, commit: str) -> list[str] | None:
+    """Paths (relative to ``root``) changed between ``commit`` and HEAD; None if the
+    commit is unknown (e.g. after a rebase or a shallow clone) or outside git."""
+    return _git_paths(
+        root.resolve(),
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-renames",
+        "--relative",
+        commit,
+        "HEAD",
+        "--",
+        ".",
+    )

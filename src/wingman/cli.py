@@ -253,8 +253,13 @@ def index(app: AppContext, names: tuple[str, ...], full: bool, no_embed: bool) -
             failed = True
             continue
         share = f" ({100 * stats.refs_resolved // stats.refs}%)" if stats.refs else ""
+        unchanged = (
+            f"{stats.files_scanned} checked (changed according to git)"
+            if stats.mode == "git"
+            else f"{stats.files_unchanged} unchanged"
+        )
         click.echo(
-            f"{repo_info.name}: {stats.files_indexed} indexed, {stats.files_unchanged} unchanged, "
+            f"{repo_info.name}: {stats.files_indexed} indexed, {unchanged}, "
             f"{stats.files_removed} removed; {stats.refs_resolved}/{stats.refs} references "
             f"resolved{share}; {stats.seconds}s"
         )

@@ -17,7 +17,16 @@ from wingman.extract import content_hash, extract
 from wingman.extract.base import short_hash
 from wingman.extract.model import Extraction
 from wingman.resolver import Changes, resolve_workspace
-from wingman.scanner import SourceFile, is_generated, is_test_path, scan, scan_paths
+from wingman.scanner import (
+    SourceFile,
+    git_changed_since,
+    git_dirty,
+    is_generated,
+    is_test_path,
+    rules_hash,
+    scan,
+    scan_paths,
+)
 from wingman.storage.schema import (
     endpoints,
     files,
@@ -47,6 +56,8 @@ class IndexStats:
     edges: int = 0
     http_calls: int = 0
     """Client calls matched to server routes in the whole workspace (when re-matched)."""
+    mode: str = "scan"
+    """How changed files were found: scan (all files hashed), git, or paths."""
     errors: list[str] = field(default_factory=list)
     seconds: float = 0.0
 
@@ -72,16 +83,42 @@ def index_repository(
     progress: ProgressCallback | None = None,
 ) -> IndexStats:
     """Index ``repo``; with ``paths`` (repository-relative) only those files are
-    checked: re-parsed if changed, removed from the index if gone or ignored."""
+    checked: re-parsed if changed, removed from the index if gone or ignored.
+
+    Without ``paths`` in a git repository, git tells which files can have changed since
+    the last run (see ``_git_candidates``); other repositories are scanned and every
+    file's content hash is compared."""
     root = Path(repo.root_path)
     if not root.is_dir():
         raise IndexingError(f"Repository path does not exist: {root}")
 
     started = time.monotonic()
     stats = IndexStats()
+    with engine.connect() as conn:
+        state = (
+            conn.execute(
+                select(repositories.c.index_state).where(repositories.c.id == repo.id)
+            ).scalar_one()
+            or {}
+        )
+        first_index = (
+            conn.execute(select(files.c.id).where(files.c.repo_id == repo.id).limit(1)).first()
+            is None
+        )
+    rules = rules_hash(root)
+    if paths is not None:  # single files (e.g. the edit hook): last_commit stays
+        stats.mode = "paths"
+        commit = repo.last_commit
+        new_state = {**state, "dirty": sorted(set(state.get("dirty", [])) | set(paths))}
+    else:
+        commit = git.head_commit(root)
+        dirty = git_dirty(root) if commit else None
+        new_state = {"rules": rules, "dirty": sorted(dirty or [])}
+        if not full and not first_index and dirty is not None and state.get("rules") == rules:
+            paths = _git_candidates(root, repo.last_commit, dirty, state)
+            stats.mode = "git" if paths is not None else "scan"
     sources = scan(root) if paths is None else scan_paths(root, paths)
     stats.files_scanned = len(sources)
-    commit = git.head_commit(root) if paths is None else repo.last_commit
 
     with engine.begin() as conn:
         backend = backend_for(conn)
@@ -146,11 +183,11 @@ def index_repository(
                 select(repositories.c.workspace_id).where(repositories.c.id == repo.id)
             ).scalar_one()
             http.clear_http_refs(conn, workspace_id)  # rebuilt below, never "stale"
-            if full or not existing:
+            if full or first_index:
                 # first index: other repositories may now resolve into it; --full:
                 # everything; references elsewhere into deleted symbols lost their target
                 scope = {repo.id} | _repos_with_stale_refs(conn, workspace_id)
-                if not existing:
+                if first_index:
                     scope |= _workspace_repos(conn, workspace_id)
                 changes = None
             else:  # only what the changed files can affect
@@ -175,9 +212,24 @@ def index_repository(
         conn.execute(
             update(repositories)
             .where(repositories.c.id == repo.id)
-            .values(last_commit=commit, updated_at=now)
+            .values(last_commit=commit, updated_at=now, index_state=new_state)
         )
     return stats
+
+
+def _git_candidates(
+    root: Path, last_commit: str | None, dirty: list[str], state: dict
+) -> list[str] | None:
+    """Files that can differ from the index: changed in commits since the last run,
+    different from HEAD now, or different from the then-HEAD at the last run (their
+    indexed content is not the committed one). Everything else is unchanged, so its
+    content does not need to be read. None if git cannot tell."""
+    if not last_commit:
+        return None
+    committed = git_changed_since(root, last_commit)
+    if committed is None:  # unknown commit, e.g. after a rebase or in a shallow clone
+        return None
+    return sorted(set(committed) | set(dirty) | set(state.get("dirty", [])))
 
 
 def _workspace_repos(conn: Connection, workspace_id: int) -> set[int]:
