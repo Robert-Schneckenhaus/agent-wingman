@@ -28,7 +28,14 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from wingman.config import EmbeddingConfig
 from wingman.extract import content_hash
-from wingman.storage.schema import embedding_cache, files, repositories, symbols
+from wingman.storage.schema import (
+    doc_chunks,
+    documents,
+    embedding_cache,
+    files,
+    repositories,
+    symbols,
+)
 from wingman.storage.search import identifier_words
 
 # Symbols that get an embedding; members such as fields and properties are found via
@@ -222,6 +229,30 @@ def _missing(conn: Connection, workspace_id: int, model: str):
     ).all()
 
 
+def _missing_chunks(conn: Connection, workspace_id: int, model: str):
+    cached = select(embedding_cache.c.text_hash).where(embedding_cache.c.model == model)
+    return conn.execute(
+        select(
+            doc_chunks.c.heading_path,
+            doc_chunks.c.text,
+            doc_chunks.c.embed_hash,
+            documents.c.title,
+        )
+        .join(documents, documents.c.id == doc_chunks.c.document_id)
+        .where(
+            documents.c.workspace_id == workspace_id,
+            doc_chunks.c.embed_hash.is_not(None),
+            doc_chunks.c.embed_hash.not_in(cached),
+        )
+    ).all()
+
+
+def chunk_text_for_embedding(title: str | None, heading_path: str | None, text: str) -> str:
+    """The text that represents a documentation chunk (see ``wingman.docs``)."""
+    header = " > ".join(x for x in (title, heading_path) if x)
+    return f"{header}\n{text}"[:MAX_TEXT_CHARS]
+
+
 def member_names(conn: Connection, parent_ids: list[int]) -> dict[int, list[str]]:
     members: dict[int, list[str]] = defaultdict(list)
     for start in range(0, len(parent_ids), 500):
@@ -296,6 +327,14 @@ def ensure_embeddings(
             else:
                 stats.skipped += 1
 
+    with engine.connect() as conn:
+        for row in _missing_chunks(conn, workspace_id, embedder.model):
+            if row.embed_hash in texts:
+                continue
+            text = chunk_text_for_embedding(row.title, row.heading_path, row.text)
+            if text_hash(text) == row.embed_hash:
+                texts[row.embed_hash] = text
+
     stats.pending = len(texts)
     # similar lengths per batch: padding to the longest text dominates the cost (~3x)
     todo = sorted(texts.items(), key=lambda item: len(item[1]))
@@ -322,7 +361,18 @@ def ensure_embeddings(
 _VECTORS: dict[tuple, tuple[tuple, np.ndarray, np.ndarray]] = {}
 
 
-def _vector_query(workspace_id: int, model: str):
+def _vector_query(workspace_id: int, model: str, owner: str = "symbol"):
+    if owner == "chunk":
+        return (
+            select(doc_chunks.c.id, embedding_cache.c.vector)
+            .join(documents, documents.c.id == doc_chunks.c.document_id)
+            .join(
+                embedding_cache,
+                (embedding_cache.c.text_hash == doc_chunks.c.embed_hash)
+                & (embedding_cache.c.model == model),
+            )
+            .where(documents.c.workspace_id == workspace_id)
+        )
     return (
         select(symbols.c.id, embedding_cache.c.vector)
         .join(files, files.c.id == symbols.c.file_id)
@@ -336,17 +386,19 @@ def _vector_query(workspace_id: int, model: str):
     )
 
 
-def load_vectors(conn: Connection, workspace_id: int, model: str) -> tuple[np.ndarray, np.ndarray]:
-    """``(symbol_ids, matrix)`` of all embedded symbols; cached while unchanged."""
-    subquery = _vector_query(workspace_id, model).subquery()
+def load_vectors(
+    conn: Connection, workspace_id: int, model: str, owner: str = "symbol"
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(ids, matrix)`` of all embedded symbols (or doc chunks); cached while unchanged."""
+    subquery = _vector_query(workspace_id, model, owner).subquery()
     signature = tuple(
         conn.execute(select(func.count(), func.max(subquery.c.id), func.sum(subquery.c.id))).one()
     )
-    key = (str(conn.engine.url), workspace_id, model)
+    key = (str(conn.engine.url), workspace_id, model, owner)
     cached = _VECTORS.get(key)
     if cached is not None and cached[0] == signature:
         return cached[1], cached[2]
-    rows = conn.execute(_vector_query(workspace_id, model)).all()
+    rows = conn.execute(_vector_query(workspace_id, model, owner)).all()
     if not rows:
         return np.zeros(0, dtype=np.int64), np.zeros((0, 0), dtype=np.float32)
     ids = np.array([r.id for r in rows], dtype=np.int64)
@@ -363,8 +415,10 @@ def semantic_search(
     *,
     limit: int = 100,
     prepare_seconds: float | None = 10.0,
+    owner: str = "symbol",
 ) -> list[tuple[int, float]]:
-    """Symbols most similar to ``text`` as ``(symbol_id, cosine similarity)``.
+    """Symbols (or doc chunks with ``owner="chunk"``) most similar to ``text`` as
+    ``(id, cosine similarity)``.
 
     With ``prepare_seconds`` missing embeddings are computed first, within that time
     budget (the model is loaded anyway for the query).
@@ -372,7 +426,7 @@ def semantic_search(
     if prepare_seconds:
         ensure_embeddings(engine, embedder, workspace_id, max_seconds=prepare_seconds)
     with engine.connect() as conn:
-        ids, matrix = load_vectors(conn, workspace_id, embedder.model)
+        ids, matrix = load_vectors(conn, workspace_id, embedder.model, owner)
     if ids.size == 0:
         return []
     query = embedder.embed_query(text)

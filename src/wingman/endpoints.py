@@ -120,7 +120,7 @@ def specificity(client: str, server: str) -> float:
     return sum((1.0 if x != PARAM else 0.5) for x, y in pairs if x == y)
 
 
-def _load(conn: Connection, workspace_id: int, role: str) -> list[_Endpoint]:
+def load_endpoints(conn: Connection, workspace_id: int, role: str) -> list[_Endpoint]:
     rows = conn.execute(
         select(
             endpoints.c.symbol_id,
@@ -153,13 +153,13 @@ def clear_http_refs(conn: Connection, workspace_id: int) -> None:
 def match_endpoints(conn: Connection, workspace_id: int) -> int:
     """Rebuild the http_call references of the workspace; returns their number."""
     clear_http_refs(conn, workspace_id)
-    servers = _load(conn, workspace_id, "server")
+    servers = load_endpoints(conn, workspace_id, "server")
     by_method: dict[str | None, list[_Endpoint]] = defaultdict(list)
     for server in servers:
         by_method[server.method].append(server)
 
     rows = []
-    for client in _load(conn, workspace_id, "client"):
+    for client in load_endpoints(conn, workspace_id, "client"):
         method = client.method or "GET"
         candidates = by_method.get(method, []) + by_method.get(None, [])  # None: any method
         scored = []
@@ -217,7 +217,7 @@ def list_endpoints(
     for row in conn.execute(select(column).where(refs.c.kind == "http_call")):
         tally[row[0]] += 1
     result = []
-    for e in _load(conn, workspace_id, role):
+    for e in load_endpoints(conn, workspace_id, role):
         if contains and contains.lower().strip("/") not in e.route:
             continue
         result.append(

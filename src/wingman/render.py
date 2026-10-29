@@ -36,6 +36,7 @@ def details(
     items: list[SymbolDetails],
     sources: dict[int, str | None] | None = None,
     notes: dict[int, list[Note]] | None = None,
+    docs: dict[int, list] | None = None,
 ) -> str:
     blocks = []
     for d in items:
@@ -56,6 +57,8 @@ def details(
         for note in (notes or {}).get(s.id, []):
             author = f" ({note.author})" if note.author else ""
             lines.append(f"  note{author}: {note.text}")
+        for doc in (docs or {}).get(s.id, []):
+            lines.append(f"  docs: {doc.citation}  [{doc.uri}]  (chunk {doc.chunk_id})")
         for label, related in (
             ("bases", d.bases),
             ("derived", d.derived),
@@ -134,4 +137,43 @@ def endpoint_list(items: list[EndpointInfo], hits: dict[int, SymbolHit], role: s
             where += f" (mapped at line {item.line})"
         matches = f"{item.matches} {counterpart}{'s' if item.matches != 1 else ''}"
         lines.append(f"{item.method or 'ANY':<6} /{item.route}  -> {where}  ({matches})")
+    return "\n".join(lines)
+
+
+def doc_hits(hits: list) -> str:
+    """Documentation search results (``wingman.docs.DocHit``)."""
+    blocks = []
+    for hit in hits:
+        snippet = " ".join(hit.text.split())
+        snippet = snippet if len(snippet) <= 500 else snippet[:499] + "…"
+        reason = f"  ({hit.reason})" if hit.reason else ""
+        blocks.append(f"[chunk {hit.chunk_id}] {hit.citation}{reason}\n  {hit.uri}\n  {snippet}")
+    return "\n\n".join(blocks)
+
+
+def doc_chunk(hit, links: list[tuple[str, str, float]]) -> str:
+    lines = [f"[chunk {hit.chunk_id}] {hit.citation}", hit.uri, "", hit.text]
+    if links:
+        lines += ["", "Linked to:"]
+        lines += [
+            f"  {key}  ({source}, {confidence:.2f})" for key, source, confidence in links[:20]
+        ]
+    return "\n".join(lines)
+
+
+def doc_add_results(results: list) -> str:
+    lines = []
+    for r in results:
+        if r.error:
+            lines.append(f"{r.source}: {r.error}")
+            continue
+        state = "updated" if r.changed else "unchanged"
+        links = r.links
+        detail = (
+            f"{links.total} links ({links.name_match} by name, {links.route} by route, "
+            f"{links.manual} manual)"
+            if links
+            else ""
+        )
+        lines.append(f"#{r.document_id} {r.title} ({r.chunks} chunks, {state}): {detail}")
     return "\n".join(lines)

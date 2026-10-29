@@ -15,6 +15,7 @@ from wingman import (
     __version__,
     claude_setup,
     context,
+    docs,
     embeddings,
     git,
     hooks,
@@ -476,6 +477,7 @@ def context_cmd(app, task, task_file, limit, budget, code, semantic, as_json) ->
             limit=limit,
             include_code=code,
             semantic=app.semantic_search if semantic else None,
+            semantic_docs=app.semantic_doc_search if semantic else None,
         )
         output = pack.to_dict() if as_json else context.render_pack(pack, budget=budget)
     _echo_warnings(app)
@@ -499,17 +501,19 @@ def symbol_cmd(app, name, code, repo, kinds, as_json) -> None:
         details = [query.symbol_details(conn, h.id) for h in found]
         sources = {h.id: query.read_source(conn, h.id) for h in found} if code else {}
         notes = query.notes_for_symbols(conn, app.workspace_id(conn), [h.id for h in found])
+        linked = docs.docs_for_symbols(conn, app.workspace_id(conn), [h.id for h in found])
     if as_json:
         _echo_json(
             [
                 d.to_dict()
                 | {"notes": [n.text for n in notes.get(d.symbol.id, [])]}
+                | {"docs": [h.to_dict() for h in linked.get(d.symbol.id, [])]}
                 | ({"code": sources.get(d.symbol.id)} if code else {})
                 for d in details
             ]
         )
     else:
-        click.echo(render.details(details, sources, notes))
+        click.echo(render.details(details, sources, notes, linked))
 
 
 @main.command("callers")
@@ -696,6 +700,112 @@ def note_remove(app, note_id) -> None:
         except store.StoreError as exc:
             raise click.ClickException(str(exc)) from exc
     click.echo(f"Note #{note_id} removed.")
+
+
+# --- external documentation --------------------------------------------------------
+
+
+@main.group("doc")
+def doc_group() -> None:
+    """External documentation (Markdown, HTML, PDF, OpenAPI, URLs) linked to code."""
+
+
+@doc_group.command("add")
+@click.argument("sources", nargs=-1, required=True)
+@click.option(
+    "--link", "-l", "links", multiple=True, help="Symbol or repo:path the document is about."
+)
+@pass_app
+def doc_add(app, sources, links) -> None:
+    """Add files, directories or URLs. Identifiers and file paths mentioned in the text
+    are linked to code automatically; OpenAPI operations to the matching endpoints."""
+    with app.engine.connect() as conn:
+        workspace_id = app.workspace_id(conn)
+    results = docs.add_sources(app.engine, workspace_id, sources, links=list(links) or None)
+    if not results:
+        raise click.ClickException("No supported documents found.")
+    click.echo(render.doc_add_results(results))
+    if any(r.changed for r in results):
+        _embed(app, max_seconds=None, quiet_if_disabled=True)
+    if all(r.error for r in results):
+        raise SystemExit(1)
+
+
+@doc_group.command("list")
+@json_option
+@pass_app
+def doc_list(app, as_json) -> None:
+    """List documents with their number of chunks and links."""
+    with app.engine.connect() as conn:
+        items = docs.list_documents(conn, app.workspace_id(conn))
+    if as_json:
+        _echo_json([i.__dict__ for i in items])
+        return
+    if not items:
+        click.echo("No documents. Add some with: wingman doc add <file|dir|url>")
+    for i in items:
+        manual = f"  links: {', '.join(i.manual_links)}" if i.manual_links else ""
+        click.echo(
+            f"#{i.id:<4} {i.source_type:<8} {i.title}  ({i.chunks} chunks, {i.links} links)\n"
+            f"      {i.uri}{manual}"
+        )
+
+
+@doc_group.command("search")
+@click.argument("text", nargs=-1, required=True)
+@click.option("--limit", "-n", default=5, show_default=True)
+@semantic_option
+@json_option
+@pass_app
+def doc_search(app, text, limit, semantic, as_json) -> None:
+    """Search documentation chunks (full-text + semantic)."""
+    text = " ".join(text)
+    similar = app.semantic_doc_search(text) if semantic else None
+    with app.engine.connect() as conn:
+        hits = docs.search_docs(conn, app.workspace_id(conn), text, limit=limit, semantic=similar)
+    _echo_warnings(app)
+    if as_json:
+        _echo_json([h.to_dict() for h in hits])
+    else:
+        click.echo(render.doc_hits(hits) if hits else "No documentation matched.")
+
+
+@doc_group.command("show")
+@click.argument("chunk_id", type=int)
+@pass_app
+def doc_show(app, chunk_id) -> None:
+    """Print one documentation chunk and the code it is linked to."""
+    with app.engine.connect() as conn:
+        hit = docs.read_chunk(conn, chunk_id)
+        if hit is None:
+            raise click.ClickException(f"No documentation chunk #{chunk_id}.")
+        click.echo(render.doc_chunk(hit, docs.linked_symbols(conn, chunk_id)))
+
+
+@doc_group.command("remove")
+@click.argument("document")
+@pass_app
+def doc_remove(app, document) -> None:
+    """Remove a document (by #id, URI or unique path suffix)."""
+    with app.engine.begin() as conn:
+        workspace_id = app.workspace_id(conn)
+        document_id = docs.find_document(conn, workspace_id, document)
+        if document_id is None:
+            raise click.ClickException(f"Unknown document '{document}'. See: wingman doc list")
+        docs.remove_document(conn, workspace_id, document_id)
+    click.echo(f"Document #{document_id} removed.")
+
+
+@doc_group.command("refresh")
+@pass_app
+def doc_refresh(app) -> None:
+    """Re-read all documents (files and URLs) and rebuild their links to the code."""
+    with app.engine.connect() as conn:
+        workspace_id = app.workspace_id(conn)
+    results = docs.refresh(app.engine, workspace_id)
+    click.echo(render.doc_add_results(results) or "No documents.")
+    if any(r.changed for r in results):
+        _embed(app, max_seconds=None, quiet_if_disabled=True)
 
 
 # --- agent integration -----------------------------------------------------------

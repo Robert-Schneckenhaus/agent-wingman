@@ -49,7 +49,8 @@ def create_db_engine(url: str) -> Engine:
 def _alembic_config(engine: Engine) -> AlembicConfig:
     cfg = AlembicConfig()
     cfg.set_main_option("script_location", MIGRATIONS_LOCATION)
-    cfg.set_main_option("sqlalchemy.url", engine.url.render_as_string(hide_password=False))
+    url = engine.url.render_as_string(hide_password=False)
+    cfg.set_main_option("sqlalchemy.url", url.replace("%", "%%"))  # configparser syntax
     return cfg
 
 

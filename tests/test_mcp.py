@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import anyio
 import pytest
 from mcp.client import Client
@@ -41,6 +43,9 @@ def test_lists_tools_with_annotations(ws, tmp_path):
         "find_tests_for",
         "get_file_outline",
         "list_endpoints",
+        "search_docs",
+        "read_doc",
+        "add_doc",
         "add_note",
         "reindex",
     }
@@ -97,3 +102,14 @@ def test_reindex(call, tmp_path):
     assert "ts_app: 1 indexed" in text
     assert "function newHelper" in call("get_symbol", name="newHelper")
     assert "0 indexed" in call("reindex")
+
+
+def test_doc_tools(call):
+    docs_dir = Path(__file__).parent / "fixtures" / "docs"
+    added = call("add_doc", source=str(docs_dir / "billing-guide.md"))
+    assert "Billing Guide (4 chunks, updated)" in added
+    found = call("search_docs", query="reduced rate books")
+    assert "Billing Guide > Tax calculation > Reduced rates (#reduced-rates)" in found
+    chunk_id = int(found.split("[chunk ", 1)[1].split("]", 1)[0])
+    assert "Books and food use a reduced rate" in call("read_doc", chunk_id=chunk_id)
+    assert "docs: Billing Guide > Tax calculation" in call("get_symbol", name="roundMoney")

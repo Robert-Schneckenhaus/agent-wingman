@@ -1,6 +1,6 @@
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
-from sqlalchemy import inspect
+from sqlalchemy import URL, create_engine, inspect
 
 from wingman.storage import db
 from wingman.storage.schema import metadata
@@ -49,3 +49,10 @@ def test_foreign_keys_enabled(tmp_path):
     engine = _engine(tmp_path)
     with engine.connect() as conn:
         assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+
+
+def test_urls_with_percent_signs():
+    # postgresql+psycopg://u@/db?host=%2Fvar%2Frun: configparser treats "%" specially
+    url = URL.create("sqlite", database="index.db", query={"uri": "true", "vfs": "/run"})
+    assert "%2F" in url.render_as_string()
+    assert db.head_revision(create_engine(url)) is not None

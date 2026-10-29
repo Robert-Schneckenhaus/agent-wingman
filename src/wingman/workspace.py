@@ -125,8 +125,11 @@ class Workspace:
         """Use a specific embedder (tests, other providers)."""
         self._embedder, self._embedder_checked = embedder, True
 
-    def semantic_search(self, text: str, limit: int = 200) -> list[tuple[int, float]] | None:
-        """Semantic candidates for ``text``, or None if unavailable (reason in warnings)."""
+    def semantic_search(
+        self, text: str, limit: int = 200, owner: str = "symbol"
+    ) -> list[tuple[int, float]] | None:
+        """Semantic candidates (symbols, or doc chunks with ``owner="chunk"``) for ``text``,
+        or None if unavailable (reason in warnings)."""
         embedder = self.embedder
         if embedder is None:
             return None
@@ -134,11 +137,14 @@ class Workspace:
             workspace_id = self.workspace_id(conn)
         try:
             return embeddings.semantic_search(
-                self.engine, embedder, workspace_id, text, limit=limit
+                self.engine, embedder, workspace_id, text, limit=limit, owner=owner
             )
         except embeddings.EmbeddingError as exc:
             self.embedding_failed(exc)  # do not retry a broken model in this process
             return None
+
+    def semantic_doc_search(self, text: str) -> list[tuple[int, float]] | None:
+        return self.semantic_search(text, limit=50, owner="chunk")
 
     def _warn(self, message: str) -> None:
         if message not in self.warnings:

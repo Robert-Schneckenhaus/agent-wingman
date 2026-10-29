@@ -257,6 +257,8 @@ documents = Table(
     Column("content_hash", String(64)),
     Column("fetched_at", DateTime(timezone=True)),
     Column("metadata", JSON),
+    Column("links", JSON, comment="Targets given by the user (symbol names, paths)"),
+    UniqueConstraint("workspace_id", "uri"),
 )
 
 doc_chunks = Table(
@@ -269,7 +271,9 @@ doc_chunks = Table(
     Column("locator", Text, comment="Page number or anchor"),
     Column("text", Text, nullable=False),
     Column("token_count", Integer),
+    Column("embed_hash", String(64), comment="Key into embedding_cache"),
     Index(None, "document_id"),
+    Index(None, "embed_hash"),
 )
 
 doc_links = Table(

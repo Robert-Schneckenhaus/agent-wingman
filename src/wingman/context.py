@@ -66,7 +66,7 @@ class TaskSignals:
     paths: list[str] = field(default_factory=list)
 
 
-def _looks_like_code(token: str) -> bool:
+def looks_like_code(token: str) -> bool:
     if re.search(r"d__\d|^<", token):  # compiler-generated async state machines
         return False
     if token.isupper() and "_" not in token:  # acronyms such as PDF, VAT
@@ -126,7 +126,7 @@ def analyze_task(text: str) -> TaskSignals:
         if len(match.group(1)) >= 3 and match.group(1).lower() not in _STOPWORDS:
             add_identifier(match.group(1))
     for token in _IDENTIFIER.findall(prose):  # CamelCase, snake_case, A.B
-        if _looks_like_code(token):
+        if looks_like_code(token):
             add_identifier(token)
     return signals
 
@@ -186,6 +186,9 @@ class ContextPack:
     candidates: int
     unknown_paths: list[str] = field(default_factory=list)
     file_notes: list[Note] = field(default_factory=list)
+    docs: list = field(default_factory=list)
+    """Documentation chunks (``wingman.docs.DocHit``) linked to the entries or matching
+    the text."""
 
     def to_dict(self) -> dict:
         return {
@@ -198,6 +201,7 @@ class ContextPack:
             "entries": [e.to_dict() for e in self.entries],
             "unknown_paths": self.unknown_paths,
             "file_notes": [{"target": n.target_key, "text": n.text} for n in self.file_notes],
+            "docs": [d.to_dict() for d in self.docs],
         }
 
 
@@ -223,9 +227,12 @@ def find_relevant(
     include_code: bool = False,
     code_entries: int = 3,
     semantic: Callable[[str], list[tuple[int, float]] | None] | None = None,
+    semantic_docs: Callable[[str], list[tuple[int, float]] | None] | None = None,
+    max_docs: int = 4,
 ) -> ContextPack:
     """``semantic`` maps text to ``(symbol_id, similarity)`` candidates (see
-    ``Workspace.semantic_search``); without it only full-text search is used."""
+    ``Workspace.semantic_search``), ``semantic_docs`` to ``(chunk_id, similarity)``;
+    without them only full-text search is used."""
     signals = analyze_task(text)
     scores = _Scores()
     unknown_paths: list[str] = []
@@ -345,7 +352,37 @@ def find_relevant(
         candidates=len(scores.score),
         unknown_paths=sorted(set(unknown_paths)),
         file_notes=notes_service.for_files(conn, workspace_id, files),
+        docs=_related_docs(conn, workspace_id, entries, prose, semantic_docs, max_docs),
     )
+
+
+def _related_docs(conn, workspace_id, entries, prose, semantic_docs, limit):
+    from wingman import docs  # docs uses analyze_task from this module
+
+    if limit <= 0 or not docs.has_documents(conn, workspace_id):
+        return []
+    result, seen, texts = [], set(), set()
+    linked = docs.docs_for_symbols(
+        conn, workspace_id, [e.hit.id for e in entries[:5]], per_symbol=2
+    )
+    for entry in entries[:5]:
+        for hit in linked.get(entry.hit.id, []):
+            if hit.chunk_id not in seen and hit.text not in texts:  # e.g. spec v1 and v2
+                hit.reason = f"linked to {entry.hit.name}"
+                seen.add(hit.chunk_id)
+                texts.add(hit.text)
+                result.append(hit)
+    similar = semantic_docs(prose) if semantic_docs is not None and prose.strip() else None
+    for hit in docs.search_docs(conn, workspace_id, _fts_text(prose), limit=3, semantic=similar):
+        if hit.chunk_id not in seen and hit.text not in texts:
+            texts.add(hit.text)
+            hit.reason = {
+                "meaning": "similar meaning",
+                "text+meaning": "text match + similar meaning",
+            }.get(hit.reason or "", "text match")
+            seen.add(hit.chunk_id)
+            result.append(hit)
+    return result[:limit]
 
 
 def _is_frame_line(line: str) -> bool:
@@ -432,6 +469,17 @@ def render_pack(pack: ContextPack, *, budget: int = 4000) -> str:
         used += len(block) + 1
 
     footer = []
+    doc_lines = []
+    for doc in pack.docs:
+        snippet = " ".join(doc.text.split())
+        snippet = snippet if len(snippet) <= 300 else snippet[:299] + "…"
+        line = f"- {doc.citation} [{doc.uri}] ({doc.reason})\n  {snippet}"
+        if used + len(line) > max_chars and doc_lines:
+            break
+        doc_lines.append(line)
+        used += len(line) + 1
+    if doc_lines:
+        footer += ["\n## Documentation", *doc_lines]
     if pack.file_notes:
         footer.append("\nNotes on these files:")
         footer += [f"- {n.target_key}: {n.text}" for n in pack.file_notes]

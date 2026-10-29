@@ -7,7 +7,7 @@ from pathlib import Path
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
-from wingman import __version__, context, notes, render
+from wingman import __version__, context, docs, notes, render
 from wingman import endpoints as http
 from wingman import query as queries
 from wingman.indexer import IndexingError, index_repository
@@ -67,6 +67,7 @@ def create_server(home: Path | None = None, workspace: Workspace | None = None) 
                 limit=limit,
                 include_code=include_code,
                 semantic=ws.semantic_search,
+                semantic_docs=ws.semantic_doc_search,
             )
             return with_warnings(context.render_pack(pack, budget=budget_tokens))
 
@@ -110,7 +111,8 @@ def create_server(home: Path | None = None, workspace: Workspace | None = None) 
             notes_by_id = queries.notes_for_symbols(
                 conn, ws.workspace_id(conn), [h.id for h in hits]
             )
-            return render.details(details, sources, notes_by_id)
+            linked = docs.docs_for_symbols(conn, ws.workspace_id(conn), [h.id for h in hits])
+            return render.details(details, sources, notes_by_id, linked)
 
     @server.tool(annotations=READ_ONLY)
     def get_callers(name: str, depth: int = 1) -> str:
@@ -174,6 +176,42 @@ def create_server(home: Path | None = None, workspace: Workspace | None = None) 
             )
             hits = queries.get_symbols(conn, [i.symbol_id for i in items])
         return render.endpoint_list(items, hits, role)
+
+    @server.tool(annotations=READ_ONLY)
+    def search_docs(query: str, limit: int = 5) -> str:
+        """Search the external documentation added to the index (specs, PDFs, wiki pages,
+        OpenAPI). Returns citable chunks with document, heading and page/anchor."""
+        similar = ws.semantic_doc_search(query)
+        with ws.engine.connect() as conn:
+            hits = docs.search_docs(
+                conn, ws.workspace_id(conn), query, limit=limit, semantic=similar
+            )
+        if not hits:
+            return with_warnings("No documentation matched.")
+        return with_warnings(render.doc_hits(hits))
+
+    @server.tool(annotations=READ_ONLY)
+    def read_doc(chunk_id: int) -> str:
+        """Full text of one documentation chunk (ids come from search_docs, get_symbol and
+        find_relevant_for_task) and the code it is linked to."""
+        with ws.engine.connect() as conn:
+            hit = docs.read_chunk(conn, chunk_id)
+            if hit is None:
+                return f"No documentation chunk #{chunk_id}."
+            return render.doc_chunk(hit, docs.linked_symbols(conn, chunk_id))
+
+    @server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False))
+    def add_doc(source: str, link: list[str] | None = None) -> str:
+        """Add documentation to the index: a URL, or a file or directory path (Markdown,
+        HTML, PDF, OpenAPI JSON/YAML). ``link``: symbols or repo:paths the document is
+        about (names mentioned in the text are linked automatically)."""
+        path = Path(source)
+        if not source.startswith(("http://", "https://")) and not path.is_absolute():
+            source = str(ws.config.root / path)
+        with ws.engine.connect() as conn:
+            workspace_id = ws.workspace_id(conn)
+        results = docs.add_sources(ws.engine, workspace_id, [source], links=link)
+        return render.doc_add_results(results) or f"No supported documents found in {source}."
 
     @server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False))
     def add_note(target: str, text: str) -> str:

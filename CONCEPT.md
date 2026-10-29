@@ -178,6 +178,18 @@ Ablauf:
    - *Automatisch*: Bezeichner im Text (`InvoiceService`, `calc_tax()`) werden gegen die Symbolnamen gematcht. Zusätzlich gibt es Kandidaten über Embedding-Ähnlichkeit oberhalb einer Schwelle, gespeichert mit Konfidenz und `link_source`.
 3. Re-Fetch von URLs per `ETag`/`Last-Modified` oder Content-Hash.
 
+> *Umgesetzt (Phase 6):* `src/wingman/docs.py`, Befehle `wingman doc add|list|search|show|remove|refresh`, MCP-Tools `search_docs`, `read_doc`, `add_doc`.
+> - **Quellen:** Markdown, Text/RST, HTML (lokal oder URL, nur `<main>`/`<article>`, ohne Navigation und Skripte; Parser aus der Standardbibliothek statt `trafilatura`), PDF über `pypdf` statt `pymupdf` (leichter; Extra `docs`; Lesezeichen werden zu Überschriften), OpenAPI JSON/YAML. Verzeichnisse werden rekursiv eingelesen, ohne HTML (in Quellbäumen sind das App-Templates) und ohne JSON/YAML, das keine OpenAPI-Spezifikation ist.
+> - **Chunks:** an Überschriften (Code-Blöcke werden beachtet), PDF-Seiten oder OpenAPI-Operationen, lange Abschnitte an Absätzen auf ca. 2.000 Zeichen. Locator: Anker (`#reduced-rates`), `page 3` oder `GET /api/invoices/{id}/tax`.
+> - **Linking** (in `doc_links`, Ziel per `stable_key` / `repo:path`):
+>   - *manual* (`--link`, gilt für jeden Chunk),
+>   - *name_match*: nur Namen, die nach Code aussehen (`TaxCalculator.Breakdown`, `roundMoney()`, `tax_rate`) oder Typnamen in Backticks, exakt und ohne Properties/Felder. Prosa-Wörter wie „main“ oder „github“ erzeugten im ersten Test auf nest/eShop sonst nur Fehl-Links. Dokumente innerhalb eines Repos verlinken nur in dieses Repo (andere nur über qualifizierte Namen); mehrdeutige Pfade wie `src/app.module.ts` werden nur verlinkt, wenn sie eindeutig oder im selben Verzeichnisbaum sind.
+>   - *route*: OpenAPI-Operationen auf die Server-Endpunkte aus Phase 3.
+>   Die Semantik-Kandidaten aus 3.7 werden nicht gespeichert, sondern zur Abfragezeit über die semantische Doku-Suche gefunden.
+> - **Suche:** FTS5-Tabelle `doc_chunks_fts` (LIKE-Fallback für andere DBs) plus Embeddings der Chunks im selben inhaltsadressierten Cache wie die Symbole. Context Packs enden mit einem Abschnitt „Documentation“ (verlinkte Chunks der Top-Treffer, dann Text-/Bedeutungstreffer, identische Chunks z. B. aus Spec v1/v2 nur einmal).
+> - **Aktualisierung:** `wingman doc refresh` liest Dateien/URLs neu (Content-Hash) und baut alle Links neu auf. Kein automatisches Relinking bei jedem `wingman index`.
+> - **Erster Praxistest:** 71 Dokumente aus nest, eShop und CleanArchitecture (READMEs, ADRs, zwei OpenAPI-Specs von eShop) in 19 s eingelesen; 74 Links, davon keiner mehr in ein fremdes Repo. Die Frage „Creating a catalog item through the HTTP API returns 400 …“ liefert im Context Pack die OpenAPI-Operation `POST /api/catalog/items`, verlinkt über `CatalogApi.CreateItem`.
+
 ---
 
 ## 4. Datenmodell
@@ -571,7 +583,7 @@ Der Prototyp ist auf **einen Entwickler mit lokaler SQLite-DB** ausgelegt. Das D
 | **3 – Multi-Repo** ✅ | Paket-Abhängigkeiten zwischen Repos, HTTP-Endpunkt-Matching (ASP.NET ↔ fetch/axios) | Agent folgt Aufrufen vom Frontend ins Backend |
 | **4 – Semantik** ✅ (vorgezogen) | Embeddings (lokal, fastembed), inhaltsadressierter Vektor-Cache, Hybrid-Suche (gewichtete Fusion statt RRF) + Graph-Expansion. Gemessen mit echtem Modell (Abschnitt 9); `sqlite-vec` erst bei Bedarf | Bug-Report → relevante Stellen |
 | **5 – Summaries** ✅ (ohne echten API-Lauf) | LLM-Enricher bottom-up (Anthropic, kleines Modell, Opt-in), Cache, Budget, Datei-/Modul-Summaries | Undokumentierter Code wird durchsuchbar |
-| **6 – Externe Doku** | PDF/URL/MD/OpenAPI-Ingest, Chunking, Auto-Linking | Spezifikationen hängen am Code |
+| **6 – Externe Doku** ✅ | PDF/URL/MD/OpenAPI-Ingest, Chunking, Auto-Linking | Spezifikationen hängen am Code |
 | **7 – Breite** | JavaScript, dann Java, Python, PHP, dann **C/C++** (inkl. `compile_commands.json`, Header/Source-Zuordnung); SCIP/Roslyn/clang-Adapter; Notes | Alle Zielsprachen abgedeckt |
 | **8 – Teilen** | Export/Import-Format, CI-Build, PostgreSQL-Backend (siehe Abschnitt 10) | Team nutzt einen gemeinsamen Index |
 | **9 – Evaluation** | Benchmark: echte Issues/Commits, Recall@k der geänderten Dateien (läuft ab Phase 2 mit, wird hier ausgebaut) | Messbare Qualität, Tuning |

@@ -1,0 +1,28 @@
+openapi: 3.0.1
+info:
+  title: Invoices API
+  description: Public HTTP API for invoices.
+servers:
+  - url: https://billing.example.com/api
+paths:
+  /invoices/{id}/tax:
+    get:
+      tags: [Invoices]
+      operationId: getInvoiceTax
+      summary: Tax breakdown of an invoice
+      parameters:
+        - name: id
+          in: path
+          description: Invoice number
+      responses:
+        "200":
+          description: Tax lines per rate
+        "404":
+          description: Unknown invoice
+  /invoices:
+    post:
+      tags: [Invoices]
+      summary: Create an invoice
+      responses:
+        "201":
+          description: Created

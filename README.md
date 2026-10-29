@@ -10,8 +10,8 @@ The full design is in [CONCEPT.md](CONCEPT.md) (German).
 > **Status:** structural index for **TypeScript/TSX and C#** (symbols, docs, imports,
 > call graph, inheritance), full-text + semantic search, context packs for bug reports,
 > multi-repo linking (packages, HTTP endpoints), LLM descriptions for undocumented code,
-> an MCP server and hooks for Claude Code. External docs follow (see the roadmap in
-> CONCEPT.md).
+> external documentation linked to code, an MCP server and hooks for Claude Code. More
+> languages follow (see the roadmap in CONCEPT.md).
 
 ## Installation
 
@@ -22,6 +22,7 @@ pip install -e ".[dev]"          # from a checkout
 pip install -e ".[postgres]"     # optional PostgreSQL driver
 pip install -e ".[embeddings]"   # optional semantic search (local model via fastembed)
 pip install -e ".[summaries]"    # optional LLM descriptions (Anthropic SDK)
+pip install -e ".[docs]"         # optional PDF support for external documentation
 ```
 
 ## Usage
@@ -52,7 +53,8 @@ This registers the MCP server `wingman` (local scope), adds two hooks to
 
 MCP tools: `find_relevant_for_task` (paste a bug report, stack trace or task),
 `search_code`, `get_symbol`, `get_callers`, `get_callees`, `find_tests_for`,
-`get_file_outline`, `list_endpoints`, `add_note`, `reindex`.
+`get_file_outline`, `list_endpoints`, `search_docs`, `read_doc`, `add_doc`, `add_note`,
+`reindex`.
 
 Use `--shared` to write portable, committable config instead (`.mcp.json` and
 `.claude/settings.json`; requires `wingman` on `PATH` and the workspace in a parent
@@ -113,6 +115,30 @@ multilingual model such as `sentence-transformers/paraphrase-multilingual-MiniLM
 
 `--no-semantic` on `search`/`context` uses full-text search only. Without the model
 (offline, blocked download) everything keeps working with full-text search and a warning.
+
+### External documentation
+
+Specs, handbooks, wiki pages and API descriptions can be added to the index. They are
+split at their structure (headings, PDF pages, OpenAPI operations) and linked to the
+code they talk about:
+
+```bash
+wingman doc add docs/                          # Markdown, text/RST, PDF, OpenAPI JSON/YAML
+wingman doc add spec.pdf --link cs_app:Billing # also link the whole document to a directory
+wingman doc add https://wiki.example.com/tax   # web pages (main content only)
+wingman doc search "reduced VAT rate"          # full-text + semantic
+wingman doc show 42                            # one chunk and the code it is linked to
+wingman doc list | wingman doc refresh | wingman doc remove spec.pdf
+```
+
+- Code-looking names in the text (`TaxCalculator.Breakdown`, `roundMoney()`, a type
+  name in backticks) and file paths are linked automatically. Documents inside a
+  repository link only to that repository's code (other repositories by qualified name).
+- OpenAPI operations are linked to the server endpoints that implement them.
+- `wingman symbol` and the MCP tool `get_symbol` show the linked documentation; context
+  packs end with a "Documentation" section; MCP tools `search_docs`, `read_doc`, `add_doc`.
+- `wingman doc refresh` re-reads files and URLs and relinks everything, e.g. after
+  larger code changes. PDF support needs `pip install -e ".[docs]"`.
 
 ### Descriptions for undocumented code (LLM, opt-in)
 

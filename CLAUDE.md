@@ -30,6 +30,8 @@ uv venv && uv pip install -e ".[dev]"   # or: python -m venv .venv && pip instal
   `WINGMAN_EMBEDDINGS=off` (set in `tests/conftest.py`), so no model is downloaded
 - `src/wingman/summaries.py` – opt-in LLM descriptions for undocumented symbols (Anthropic
   SDK, bottom-up over the call graph, budget, `summary_cache`); tests use a fake summarizer
+- `src/wingman/docs.py` – external docs: loaders (Markdown/RST, HTML, PDF, OpenAPI, URLs),
+  chunking, links to code (manual, name_match, route), doc search, docs for symbols
 - `src/wingman/render.py` – text output shared by CLI and MCP server
 - `src/wingman/notes.py` – notes on symbols/files/directories (keyed by stable keys)
 - `src/wingman/workspace.py` – config + engine access shared by CLI, MCP server, hooks
@@ -40,7 +42,8 @@ uv venv && uv pip install -e ".[dev]"   # or: python -m venv .venv && pip instal
 - `tests/` – pytest; `tests/test_migrations.py` fails if schema and migrations diverge;
   `tests/fixtures/{ts_app,cs_app,shared_lib}` are small repos with known expected
   resolutions (incl. cross-repo packages and HTTP calls); the `indexed` (API) and `ws`
-  (CLI) fixtures in `tests/conftest.py` index all three
+  (CLI) fixtures in `tests/conftest.py` index all three; `tests/fixtures/docs` holds sample
+  documentation (Markdown, HTML, OpenAPI)
 
 ## Schema changes
 
