@@ -141,12 +141,34 @@ class ResolveStats:
     edges: int = 0
 
 
+@dataclass
+class Changes:
+    """What an indexing run changed, for incremental resolution."""
+
+    files: set[int]
+    """Ids of the files stored in this run (new or modified)."""
+    names: set[str]
+    """Names of the symbols removed from or added to the index."""
+    orphaned_imports: set[int] = field(default_factory=set)
+    """Imports that pointed to a file version replaced or removed in this run."""
+    new_paths: bool = False
+    """Files were added: unresolved imports anywhere may now resolve."""
+
+
 class WorkspaceResolver:
-    def __init__(self, conn: Connection, workspace_id: int, scope: set[int]) -> None:
-        """``scope``: ids of the repositories whose references are (re)resolved."""
+    def __init__(
+        self,
+        conn: Connection,
+        workspace_id: int,
+        scope: set[int],
+        changes: Changes | None = None,
+    ) -> None:
+        """``scope``: ids of the repositories whose references are (re)resolved. With
+        ``changes`` only the references those changes can affect are re-resolved."""
         self.conn = conn
         self.workspace_id = workspace_id
         self.scope = scope
+        self.changes = changes
         self._tsconfig_cache: dict[tuple[int, str], tuple[str, dict] | None] = {}
         self._packages: list[_Package] | None = None
         self._load()
@@ -250,19 +272,8 @@ class WorkspaceResolver:
                 if row.kind == "global_using":  # applies to the whole project/repository
                     self.global_usings[file.repo_id].append(row.module)
 
-        # Base types of repositories outside the scope come from their stored results.
         self.bases: dict[int, list[int]] = defaultdict(list)
-        outside = [f for f in file_ids if self.files[f].repo_id not in self.scope]
-        for chunk in _chunks(outside):
-            for row in c.execute(
-                select(refs.c.from_symbol_id, refs.c.to_symbol_id).where(
-                    refs.c.from_file_id.in_(chunk),
-                    refs.c.kind.in_(("inherits", "implements")),
-                    refs.c.to_symbol_id.is_not(None),
-                    refs.c.from_symbol_id.is_not(None),
-                )
-            ):
-                self.bases[row.from_symbol_id].append(row.to_symbol_id)
+        self.base_confidence: dict[tuple[int, int], float] = {}
 
     def repo_of(self, symbol_id: int) -> int:
         return self.files[self.symbols[symbol_id].file_id].repo_id
@@ -271,23 +282,9 @@ class WorkspaceResolver:
 
     def run(self) -> ResolveStats:
         stats = ResolveStats()
-        self._resolve_imports()
-        ref_rows = []
-        for chunk in _chunks(self.scope_files):
-            ref_rows += self.conn.execute(
-                select(
-                    refs.c.id,
-                    refs.c.from_file_id,
-                    refs.c.from_symbol_id,
-                    refs.c.target_name,
-                    refs.c.qualifier,
-                    refs.c.qualifier_type,
-                    refs.c.kind,
-                    refs.c.to_symbol_id,
-                    refs.c.confidence,
-                    refs.c.resolver,
-                ).where(refs.c.from_file_id.in_(chunk), refs.c.kind != "http_call")
-            ).all()
+        import_changes = self._resolve_imports(self._import_files())
+        ref_rows = self._select_refs(import_changes)
+        self._load_bases({r.id for r in ref_rows})
         heritage = [r for r in ref_rows if r.kind in ("inherits", "implements")]
         others = [r for r in ref_rows if r.kind not in ("inherits", "implements")]
 
@@ -295,9 +292,11 @@ class WorkspaceResolver:
         for row in heritage:  # first, so member lookups can follow base types
             result = self.resolve_type(row.target_name, row.from_file_id, row.from_symbol_id)
             results[row.id] = result
-            bases = self.bases[row.from_symbol_id] if row.from_symbol_id is not None else None
-            if result is not None and bases is not None and result.target not in bases:
-                bases.append(result.target)
+            if result is not None and row.from_symbol_id is not None:
+                bases = self.bases[row.from_symbol_id]
+                if result.target not in bases:
+                    bases.append(result.target)
+                self.base_confidence[(row.from_symbol_id, result.target)] = result.confidence
         for row in others:
             results[row.id] = self.resolve_ref(row)
 
@@ -321,14 +320,142 @@ class WorkspaceResolver:
 
         stats.refs = len(ref_rows)
         stats.resolved = sum(1 for r in results.values() if r is not None)
-        stats.edges = self._rebuild_edges(heritage, results)
+        stats.edges = self._rebuild_edges(self._affected_types(heritage))
         return stats
+
+    # --- what to (re)resolve --------------------------------------------------------
+
+    _REF_COLUMNS = (
+        refs.c.id,
+        refs.c.from_file_id,
+        refs.c.from_symbol_id,
+        refs.c.target_name,
+        refs.c.qualifier,
+        refs.c.qualifier_type,
+        refs.c.kind,
+        refs.c.to_symbol_id,
+        refs.c.confidence,
+        refs.c.resolver,
+    )
+
+    def _import_files(self) -> list[int]:
+        """Files whose imports are resolved again: the scope, or (incrementally) the
+        changed files and every file with an unresolved import, whose target may
+        have been re-indexed (new file id) or added."""
+        if self.changes is None:
+            return self.scope_files
+        result = set(self.changes.files)
+        orphaned = self.changes.orphaned_imports
+        for f in self.files.values():
+            if any(
+                imp.resolved_file_id is None and (self.changes.new_paths or imp.id in orphaned)
+                for imp in f.imports
+            ):
+                result.add(f.id)
+        return sorted(f for f in result if f in self.files)
+
+    def _workspace_refs(self, *conditions):
+        return (
+            select(*self._REF_COLUMNS)
+            .join(files, files.c.id == refs.c.from_file_id)
+            .join(repositories, repositories.c.id == files.c.repo_id)
+            .where(
+                repositories.c.workspace_id == self.workspace_id,
+                refs.c.kind != "http_call",
+                *conditions,
+            )
+        )
+
+    def _select_refs(self, import_changes: set[int]) -> list:
+        if self.changes is None:
+            rows = []
+            for chunk in _chunks(self.scope_files):
+                rows += self.conn.execute(
+                    select(*self._REF_COLUMNS).where(
+                        refs.c.from_file_id.in_(chunk), refs.c.kind != "http_call"
+                    )
+                ).all()
+            return rows
+
+        # Incremental: references in changed files or in files whose imports now
+        # resolve differently; references whose target was deleted; and every
+        # reference that mentions a name that was added or removed (as target, in its
+        # receiver chain or as the receiver type), because its resolution may change.
+        # One pass over the workspace's references is faster than several queries.
+        names = self.changes.names
+        files_ = self.changes.files | import_changes
+        split = re.compile(r"[^\w$]+")
+        selected = []
+        for row in self.conn.execute(self._workspace_refs()):
+            if (
+                row.from_file_id in files_
+                or (row.to_symbol_id is None and row.resolver is not None)
+                or row.target_name in names
+                or row.qualifier_type in names
+                or (row.qualifier is not None and not names.isdisjoint(split.split(row.qualifier)))
+            ):
+                selected.append(row)
+        return selected
+
+    def _load_bases(self, recomputed: set[int]) -> None:
+        """Base types from the stored results of all heritage references that are not
+        resolved again in this run."""
+        query = (
+            select(refs.c.id, refs.c.from_symbol_id, refs.c.to_symbol_id, refs.c.confidence)
+            .join(files, files.c.id == refs.c.from_file_id)
+            .join(repositories, repositories.c.id == files.c.repo_id)
+            .where(
+                repositories.c.workspace_id == self.workspace_id,
+                refs.c.kind.in_(("inherits", "implements")),
+                refs.c.to_symbol_id.is_not(None),
+                refs.c.from_symbol_id.is_not(None),
+            )
+        )
+        for row in self.conn.execute(query):
+            if row.id in recomputed or row.from_symbol_id not in self.symbols:
+                continue
+            if row.to_symbol_id not in self.bases[row.from_symbol_id]:
+                self.bases[row.from_symbol_id].append(row.to_symbol_id)
+            self.base_confidence[(row.from_symbol_id, row.to_symbol_id)] = row.confidence
+
+    def _affected_types(self, heritage) -> set[int]:
+        """Types whose edges (inherits/implements, overrides of their members) are
+        rebuilt: those in the resolved files, those whose base types were resolved
+        again, and (incrementally) every type deriving from them."""
+        if self.changes is None:
+            scope_files = set(self.scope_files)
+            return {
+                s.id
+                for s in self.symbols.values()
+                if s.file_id in scope_files and s.kind in TYPE_KINDS
+            }
+        affected = {
+            s.id
+            for s in self.symbols.values()
+            if s.file_id in self.changes.files and s.kind in TYPE_KINDS
+        }
+        affected |= {r.from_symbol_id for r in heritage if r.from_symbol_id in self.symbols}
+        derived: dict[int, list[int]] = defaultdict(list)
+        for type_id, bases in self.bases.items():
+            for base in bases:
+                derived[base].append(type_id)
+        frontier = list(affected)
+        while frontier:
+            current = frontier.pop()
+            for sub in derived.get(current, ()):
+                if sub not in affected:
+                    affected.add(sub)
+                    frontier.append(sub)
+        return affected
 
     # --- imports ----------------------------------------------------------------
 
-    def _resolve_imports(self) -> None:
+    def _resolve_imports(self, file_ids: list[int]) -> set[int]:
+        """Resolve the imports of ``file_ids``; returns the files whose imports now
+        point elsewhere."""
         updates = []
-        for file_id in self.scope_files:
+        changed: set[int] = set()
+        for file_id in file_ids:
             file = self.files[file_id]
             if file.language not in MODULE_LANGUAGES | C_LANGUAGES:
                 continue
@@ -342,6 +469,7 @@ class WorkspaceResolver:
                 if target != imp.resolved_file_id:
                     updates.append({"imp_id": imp.id, "target": target})
                     imp.resolved_file_id = target
+                    changed.add(file_id)
         if updates:
             self.conn.execute(
                 update(imports)
@@ -349,6 +477,7 @@ class WorkspaceResolver:
                 .values(resolved_file_id=bindparam("target")),
                 updates,
             )
+        return changed
 
     def resolve_module(self, file: _File, spec: str) -> int | None:
         """File a TypeScript module specifier points to, in any repository."""
@@ -968,27 +1097,24 @@ class WorkspaceResolver:
 
     # --- edges --------------------------------------------------------------------
 
-    def _rebuild_edges(self, heritage, results) -> int:
-        scope_files = set(self.scope_files)
-        symbol_ids = [s.id for s in self.symbols.values() if s.file_id in scope_files]
-        for chunk in _chunks(symbol_ids):
+    def _rebuild_edges(self, affected: set[int]) -> int:
+        """Rebuild inherits/implements edges of the ``affected`` types and overrides
+        edges of their members."""
+        sources = set(affected)
+        for type_id in affected:
+            for member_ids in self.members.get(type_id, {}).values():
+                sources.update(member_ids)
+        for chunk in _chunks(sorted(sources)):
             self.conn.execute(delete(symbol_edges).where(symbol_edges.c.src_id.in_(chunk)))
         edges: dict[tuple[int, int, str], float] = {}
-        for row in heritage:
-            result = results.get(row.id)
-            if result is None or row.from_symbol_id is None:
+        for type_id in affected:
+            bases = self.bases.get(type_id, [])
+            for base in bases:
+                kind = "implements" if self.symbols[base].kind == "interface" else "inherits"
+                edges[(type_id, base, kind)] = self.base_confidence.get((type_id, base), 0.9)
+            if not bases:
                 continue
-            target_kind = self.symbols[result.target].kind
-            kind = "implements" if target_kind == "interface" else "inherits"
-            edges[(row.from_symbol_id, result.target, kind)] = result.confidence
-
-        # overrides: a member with the same name in a base type
-        for type_id, bases in self.bases.items():
-            if (
-                self.symbols.get(type_id) is None
-                or self.symbols[type_id].file_id not in scope_files
-            ):
-                continue
+            # overrides: a member with the same name in a base type
             for name, member_ids in self.members.get(type_id, {}).items():
                 for member_id in member_ids:
                     if self.symbols[member_id].kind not in ("method", "property"):
@@ -1096,6 +1222,9 @@ def _package_candidates(package: _Package, subpath: str) -> list[str]:
     return [join(package.directory, c) for c in candidates]
 
 
-def resolve_workspace(conn: Connection, workspace_id: int, scope: set[int]) -> ResolveStats:
-    """(Re)resolve the references of the repositories in ``scope``."""
-    return WorkspaceResolver(conn, workspace_id, scope).run()
+def resolve_workspace(
+    conn: Connection, workspace_id: int, scope: set[int], changes: Changes | None = None
+) -> ResolveStats:
+    """(Re)resolve the references of the repositories in ``scope``, or only those
+    affected by ``changes``."""
+    return WorkspaceResolver(conn, workspace_id, scope, changes).run()

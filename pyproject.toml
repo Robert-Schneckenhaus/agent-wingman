@@ -56,3 +56,4 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/test_context.py" = ["E501"]  # verbatim stack traces
+"tests/test_incremental.py" = ["E501"]  # source snippets in the scenarios

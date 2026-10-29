@@ -16,7 +16,7 @@ from wingman import endpoints as http
 from wingman.extract import content_hash, extract
 from wingman.extract.base import short_hash
 from wingman.extract.model import Extraction
-from wingman.resolver import resolve_workspace
+from wingman.resolver import Changes, resolve_workspace
 from wingman.scanner import SourceFile, is_generated, is_test_path, scan, scan_paths
 from wingman.storage.schema import (
     endpoints,
@@ -96,6 +96,10 @@ def index_repository(
             requested = [Path(p).as_posix().removeprefix("./") for p in paths]
             existing_query = existing_query.where(files.c.path.in_(requested))
         existing = {row.path: (row.id, row.content_hash) for row in conn.execute(existing_query)}
+        changed_files: set[int] = set()
+        changed_names: set[str] = set()
+        orphaned_imports: set[int] = set()
+        new_paths = False
 
         for number, source in enumerate(sources, 1):
             try:
@@ -109,13 +113,19 @@ def index_repository(
                 stats.files_unchanged += 1
                 continue
             if previous is not None:
+                changed_names |= _symbol_names(conn, [previous[0]])
+                orphaned_imports |= _imports_into(conn, [previous[0]])
                 _delete_files(conn, backend, [previous[0]])
+            else:
+                new_paths = True
             try:
                 extraction = extract(source.path, data)
             except Exception as exc:  # a broken file must not stop the run
                 stats.errors.append(f"{source.path}: extraction failed: {exc}")
                 extraction = Extraction()
             counts = _store_file(conn, backend, repo, source, data, file_hash, extraction)
+            changed_files.add(counts[2])
+            changed_names.update(sym.name for sym in extraction.symbols)
             stats.files_indexed += 1
             stats.symbols += counts[0]
             stats.refs += counts[1]
@@ -124,6 +134,8 @@ def index_repository(
 
         scanned = {s.path for s in sources}
         removed = [file_id for path, (file_id, _) in existing.items() if path not in scanned]
+        changed_names |= _symbol_names(conn, removed)
+        orphaned_imports |= _imports_into(conn, removed)
         _delete_files(conn, backend, removed)
         stats.files_removed = len(removed)
 
@@ -134,11 +146,17 @@ def index_repository(
                 select(repositories.c.workspace_id).where(repositories.c.id == repo.id)
             ).scalar_one()
             http.clear_http_refs(conn, workspace_id)  # rebuilt below, never "stale"
-            # references from other repositories into deleted symbols lost their target
-            scope = {repo.id} | _repos_with_stale_refs(conn, workspace_id)
-            if not existing:  # first index: other repositories may now resolve into it
-                scope |= _workspace_repos(conn, workspace_id)
-            stats.edges = resolve_workspace(conn, workspace_id, scope).edges
+            if full or not existing:
+                # first index: other repositories may now resolve into it; --full:
+                # everything; references elsewhere into deleted symbols lost their target
+                scope = {repo.id} | _repos_with_stale_refs(conn, workspace_id)
+                if not existing:
+                    scope |= _workspace_repos(conn, workspace_id)
+                changes = None
+            else:  # only what the changed files can affect
+                scope = {repo.id}
+                changes = Changes(changed_files, changed_names, orphaned_imports, new_paths)
+            stats.edges = resolve_workspace(conn, workspace_id, scope, changes).edges
             stats.http_calls = http.match_endpoints(conn, workspace_id)
         stats.refs, stats.refs_resolved = _ref_counts(conn, repo.id)
         stats.seconds = round(time.monotonic() - started, 2)
@@ -328,7 +346,32 @@ def _store_file(
                 for i in extraction.imports
             ],
         )
-    return len(ids), len(extraction.refs)
+    return len(ids), len(extraction.refs), file_id
+
+
+def _symbol_names(conn: Connection, file_ids: list[int]) -> set[str]:
+    names: set[str] = set()
+    for start in range(0, len(file_ids), 500):
+        names.update(
+            conn.execute(
+                select(symbols.c.name).where(symbols.c.file_id.in_(file_ids[start : start + 500]))
+            ).scalars()
+        )
+    return names
+
+
+def _imports_into(conn: Connection, file_ids: list[int]) -> set[int]:
+    """Imports (anywhere) that resolve to the given files."""
+    found: set[int] = set()
+    for start in range(0, len(file_ids), 500):
+        found.update(
+            conn.execute(
+                select(imports.c.id).where(
+                    imports.c.resolved_file_id.in_(file_ids[start : start + 500])
+                )
+            ).scalars()
+        )
+    return found
 
 
 def _embed_hash(sym, path: str, data: bytes, members: list) -> str | None:
