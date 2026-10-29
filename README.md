@@ -7,11 +7,11 @@ another SQL database.
 
 The full design is in [CONCEPT.md](CONCEPT.md) (German).
 
-> **Status:** structural index for **TypeScript/TSX and C#** (symbols, docs, imports,
-> call graph, inheritance), full-text + semantic search, context packs for bug reports,
-> multi-repo linking (packages, HTTP endpoints), LLM descriptions for undocumented code,
-> external documentation linked to code, an MCP server and hooks for Claude Code. More
-> languages follow (see the roadmap in CONCEPT.md).
+> **Status:** structural index for **TypeScript/TSX, JavaScript, C#, Java, Python, PHP, C
+> and C++** (symbols, docs, imports, call graph, inheritance), full-text + semantic search,
+> context packs for bug reports, multi-repo linking (packages, HTTP endpoints), LLM
+> descriptions for undocumented code, external documentation linked to code, an MCP
+> server and hooks for Claude Code. Team sharing follows (see the roadmap in CONCEPT.md).
 
 ## Installation
 
@@ -168,10 +168,17 @@ re-indexed symbols get their description back for free.
 Every query command accepts `--json` for machine-readable output. Symbol names can
 be simple names, qualified-name suffixes (`Class.member`) or full qualified names.
 
-What gets indexed: files tracked or untracked-but-not-ignored by git (or all files
-outside git), minus `node_modules/`, `bin/`, `obj/`, `dist/`, `build/`, … and
+What gets indexed: `.ts/.tsx/.mts/.cts`, `.js/.jsx/.mjs/.cjs`, `.cs`, `.java`,
+`.py/.pyi`, `.php`, `.c/.h/.cc/.cpp/.cxx/.hpp/.hh/.hxx` files tracked or
+untracked-but-not-ignored by git (or all files outside git), minus `node_modules/`,
+`bin/`, `obj/`, `dist/`, `build/`, `vendor/`, `target/`, `__pycache__/`, `.venv/`, … and
 patterns from a `.wingmanignore` file in the repository root (gitignore syntax).
 Test and generated files are indexed but ranked lower.
+
+HTTP endpoints are recognized for ASP.NET (controllers, minimal APIs), NestJS, Express,
+Spring (`@GetMapping`, `@RequestMapping`), JAX-RS, FastAPI/Flask, Laravel
+(`Route::get`) and Symfony (`#[Route]`); clients for `fetch`, axios, Angular
+`HttpClient`, .NET `HttpClient`, RestTemplate, requests/httpx and Laravel `Http::`.
 
 A workspace is found by searching upwards from the current directory for
 `.wingman/config.toml`. Override with `--home <path>` or `WINGMAN_HOME`.

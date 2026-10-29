@@ -19,7 +19,9 @@ uv venv && uv pip install -e ".[dev]"   # or: python -m venv .venv && pip instal
 - `src/wingman/storage/store.py` – data access for workspaces/repositories
 - `src/wingman/storage/search.py` – search backends (SQLite FTS5, LIKE fallback)
 - `src/wingman/scanner.py` – which files get indexed
-- `src/wingman/extract/` – tree-sitter visitors per language (`typescript.py`, `csharp.py`)
+- `src/wingman/extract/` – tree-sitter visitors per language: `typescript.py` (also
+  JavaScript), `csharp.py`, `java.py`, `python.py`, `php.py`, `cpp.py` (C and C++);
+  registry in `__init__.py`
 - `src/wingman/indexer.py` – incremental indexing (hash compare, store, FTS)
 - `src/wingman/resolver.py` – resolves imports (incl. package.json registry), refs and
   inheritance across the workspace for a scope of repositories; builds `symbol_edges`
@@ -43,7 +45,8 @@ uv venv && uv pip install -e ".[dev]"   # or: python -m venv .venv && pip instal
   `tests/fixtures/{ts_app,cs_app,shared_lib}` are small repos with known expected
   resolutions (incl. cross-repo packages and HTTP calls); the `indexed` (API) and `ws`
   (CLI) fixtures in `tests/conftest.py` index all three; `tests/fixtures/docs` holds sample
-  documentation (Markdown, HTML, OpenAPI)
+  documentation (Markdown, HTML, OpenAPI); `{js,py,java,php,cpp}_app` are per-language
+  repos tested in `tests/test_lang_*.py` via `index_fixtures` (not collected by pytest)
 
 ## Schema changes
 

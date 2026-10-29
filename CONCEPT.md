@@ -92,6 +92,15 @@ Begründung: `tree-sitter` hat gute Python-Bindings (`tree-sitter-language-pack`
     - **Indirekte Aufrufe** (Funktionszeiger, Callbacks, virtuelle Aufrufe) lassen sich nur heuristisch auflösen und bekommen eine niedrige Konfidenz.
 - **Präzise Auflösung (optional, Phase 7):** für C# ein kleiner Roslyn-basierter Helfer (`dotnet tool`) bzw. `scip-dotnet`, für TS/JS `scip-typescript` bzw. die TypeScript Compiler API, für C/C++ `scip-clang` bzw. clangd/libclang auf Basis von `compile_commands.json`. Gerade bei C++ (Templates, Überladungen, Makros) bringt das am meisten. Tree-sitter bleibt die Basis, die immer funktioniert, auch ohne Build.
 
+> *Umgesetzt (Phase 7):* Extraktoren für JavaScript, Python, Java, PHP, C und C++; Tests mit je einem kleinen Fixture-Repo (`tests/fixtures/{js,py,java,php,cpp}_app`).
+> - **JavaScript** läuft über die TSX-Grammatik und den TypeScript-Extractor; CommonJS-`require` (auch destrukturiert) wird zu Imports.
+> - **Python:** Docstrings, `@property`, Klassenattribute, `self.x`-Typen aus Konstruktor-Parametern, Module-Level-Instanzen. Der Resolver löst relative/absolute Imports (Source-Roots wie `src/` über Modulnamen-Suffixe), `from pkg import modul`, `import a.b as c` und Re-Exporte über `__init__.py` auf. Qualifizierte Namen sind wie bei TypeScript dateilokal (`OrderService.cancel_order`), nicht mit Modulpfad.
+> - **Java** nutzt dieselbe Namespace-Auflösung wie C# (Paket, Single-Type-Imports, `*`-Imports, statische Imports); Records, Enums, Javadoc, Spring/JAX-RS-Routen, RestTemplate-Clients.
+> - **PHP:** Namespaces als Punkt-Namen (`App.Models.Order`), `use`/Gruppen-`use`/`use function`, Traits als Basistypen, Constructor Property Promotion. Laravel-Routen (`Route::post('/x', [C::class, 'm'])`, invokable Controller, `'C@m'`) werden zu Symbolen der Art `route`, die den Endpunkt bedienen und die Action aufrufen; Symfony `#[Route]`.
+> - **C/C++:** ein Visitor für beide Grammatiken (Header als C++). Out-of-line-Definitionen (`void Repo::find() {}`) hängen an ihrer Klasse; Deklarationen ohne Rumpf bekommen den Modifier `declaration`, und der Resolver leitet Aufrufe auf die Definition mit gleichem qualifizierten Namen um (statt `symbol_locations`). `#include "x.h"` wird relativ zur Datei oder über Pfad-Suffixe aufgelöst; Typen und Funktionen aus inkludierten Headern bekommen Import-Konfidenz. `compile_commands.json`, `#ifdef`-Bedingungen, Templates und Überladungen werden noch nicht ausgewertet.
+> - **Performance-Fix:** Die Suche nach Membern in Basistypen lief bei Typen mit vielen gleichnamigen Teilen (C++-`#ifdef`-Varianten, partielle Klassen) exponentiell; spdlog hing minutenlang. Jetzt Breitensuche, jeder Typ einmal (spdlog: 5 s).
+> - Die SCIP/Roslyn/clang-Adapter sind nicht umgesetzt (siehe Todo).
+
 ### 3.3 Extractor – was pro Datei herausgezogen wird
 
 | Element         | Inhalt                                                                 |
@@ -584,7 +593,7 @@ Der Prototyp ist auf **einen Entwickler mit lokaler SQLite-DB** ausgelegt. Das D
 | **4 – Semantik** ✅ (vorgezogen) | Embeddings (lokal, fastembed), inhaltsadressierter Vektor-Cache, Hybrid-Suche (gewichtete Fusion statt RRF) + Graph-Expansion. Gemessen mit echtem Modell (Abschnitt 9); `sqlite-vec` erst bei Bedarf | Bug-Report → relevante Stellen |
 | **5 – Summaries** ✅ (ohne echten API-Lauf) | LLM-Enricher bottom-up (Anthropic, kleines Modell, Opt-in), Cache, Budget, Datei-/Modul-Summaries | Undokumentierter Code wird durchsuchbar |
 | **6 – Externe Doku** ✅ | PDF/URL/MD/OpenAPI-Ingest, Chunking, Auto-Linking | Spezifikationen hängen am Code |
-| **7 – Breite** | JavaScript, dann Java, Python, PHP, dann **C/C++** (inkl. `compile_commands.json`, Header/Source-Zuordnung); SCIP/Roslyn/clang-Adapter; Notes | Alle Zielsprachen abgedeckt |
+| **7 – Breite** ✅ (ohne SCIP-Adapter) | JavaScript, dann Java, Python, PHP, dann **C/C++** (inkl. `compile_commands.json`, Header/Source-Zuordnung); SCIP/Roslyn/clang-Adapter; Notes | Alle Zielsprachen abgedeckt |
 | **8 – Teilen** | Export/Import-Format, CI-Build, PostgreSQL-Backend (siehe Abschnitt 10) | Team nutzt einen gemeinsamen Index |
 | **9 – Evaluation** | Benchmark: echte Issues/Commits, Recall@k der geänderten Dateien (läuft ab Phase 2 mit, wird hier ausgebaut) | Messbare Qualität, Tuning |
 
@@ -595,6 +604,8 @@ Der Prototyp ist auf **einen Entwickler mit lokaler SQLite-DB** ausgelegt. Das D
 - [ ] **Summaries mit echter API messen:** Qualität und tatsächliche Kosten mit `claude-haiku-5-5` auf eShop prüfen (braucht einen API-Key).
 - [ ] **Datei- und Modul-Summaries** aus den Symbol-Summaries aggregieren (Abschnitt 3.5).
 - [ ] **Batches-API für große Erstläufe:** halber Preis, dafür asynchron (Minuten bis Stunden).
+- [ ] **Sprachen nachschärfen** (Phase 7): Laravel-Routengruppen/`prefix()`, Django-URLs, Spring `WebClient`; Python-Typen aus Rückgabewerten von Methodenaufrufen (`order = repo.get(id)`); C/C++ mit `compile_commands.json`, `#ifdef`-Bedingungen und Überladungen; optional SCIP-Indizes (scip-typescript, scip-java, scip-python, scip-clang) als präzise Quelle.
+- [ ] **Weitere Sprachen** nach Bedarf: Go, Kotlin, Rust, Swift.
 
 ---
 
@@ -626,6 +637,18 @@ Zusammen sind das 28 MB SQLite. Eine Suche dauert unter 1 s. Vererbung, Typrefer
 - **Prosa-Bug-Report** („buyer cancels an order that was already paid …“): `Order.SetCancelledStatus` steht mit Semantik auf Platz 1. Ohne Semantik ist es nicht unter den Top 8, dort dominieren die Integration-Event-Klassen aus dem Bezeichner im Text.
 - **Stacktrace:** Die Plätze 1 und 2 sind mit und ohne Semantik gleich (beide Frames). Mit Semantik rutscht auf Platz 3 eine ähnlich klingende Exception-Klasse aus einem anderen Repo (`InvalidDecoratorItemException` in nest), ein bekanntes Rauschen.
 - **Deutscher Bug-Report:** Ohne passende Treffer, siehe „Sprache“ in Abschnitt 3.6.
+
+**Messung der neuen Sprachen (Phase 7, ohne Embeddings, 4 CPU-Kerne):**
+
+| Repo | Sprache | Dateien | Referenzen aufgelöst | Erstindex |
+|------|---------|---------|----------------------|-----------|
+| DaveGamble/cJSON | C | 101 | 3.960 / 4.701 (84 %) | 1,9 s |
+| fastapi/full-stack-fastapi-template | Python + TS | 152 | 1.530 / 4.148 (36 %) | 1,6 s |
+| spring-projects/spring-petclinic | Java | 50 | 514 / 2.337 (21 %) | 2,5 s |
+| gabime/spdlog | C++ | 154 | 3.168 / 10.883 (29 %) | 5,8 s |
+| koel/koel | PHP (Laravel) + Vue/TS | 2.370 | 17.804 / 64.202 (27 %) | 17 s |
+
+Die Quote zählt alle Referenzen, auch Aufrufe in Frameworks und Standardbibliotheken (Spring, SQLAlchemy, Laravel, `std::`), die per Definition nicht im Index liegen. Stichproben: Alle Aufrufer von `OwnerRepository.findById` in petclinic werden typisiert gefunden (0,85); `create_user` in der FastAPI-Vorlage ruft `crud.create_user` über den Modul-Import auf (0,9); 172 Laravel-Routen in koel, viele mit Vue-Clients verknüpft.
 
 ---
 
