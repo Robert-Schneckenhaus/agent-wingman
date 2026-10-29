@@ -40,7 +40,9 @@ ES_MODULE_LANGUAGES = frozenset({"typescript", "javascript"})
 # Languages where imports bind names of other modules (ES modules, Python).
 MODULE_LANGUAGES = ES_MODULE_LANGUAGES | {"python"}
 # Languages with namespaces/packages and using/import directives (C#, Java).
-NAMESPACE_LANGUAGES = frozenset({"csharp", "java"})
+NAMESPACE_LANGUAGES = frozenset({"csharp", "java", "php"})
+# Languages where members of the own type can be used without ``this.``.
+IMPLICIT_THIS_LANGUAGES = frozenset({"csharp", "java"})
 PYTHON_SUFFIXES = (".py", "/__init__.py", ".pyi", "/__init__.pyi")
 # Receivers that are runtime globals, never symbols of the repository.
 TS_GLOBALS = frozenset(
@@ -209,6 +211,7 @@ class WorkspaceResolver:
         self.types_by_name: dict[str, list[int]] = defaultdict(list)
         self.types_by_qualified: dict[str, list[int]] = defaultdict(list)
         self.callables_by_name: dict[str, list[int]] = defaultdict(list)
+        self.functions_by_qualified: dict[str, list[int]] = defaultdict(list)
         for sym in self.symbols.values():
             parent = self.symbols.get(sym.parent_id) if sym.parent_id else None
             if parent is None or parent.kind in NAMESPACE_KINDS:
@@ -220,6 +223,8 @@ class WorkspaceResolver:
                 self.types_by_qualified[sym.qualified_name].append(sym.id)
             elif sym.kind in CALLABLE_KINDS:
                 self.callables_by_name[sym.name].append(sym.id)
+                if sym.kind == "function":
+                    self.functions_by_qualified[sym.qualified_name].append(sym.id)
 
         self.global_usings: dict[int, list[str]] = defaultdict(list)
         for chunk in _chunks(file_ids):
@@ -714,7 +719,7 @@ class WorkspaceResolver:
         elif (
             segments
             and own_type is not None
-            and (qualifier.startswith("this.") or file.language in NAMESPACE_LANGUAGES)
+            and (qualifier.startswith("this.") or file.language in IMPLICIT_THIS_LANGUAGES)
         ):
             # implicit `this`: the chain starts with a member of the enclosing type
             target_type = self._walk_chain(own_type, segments)
@@ -756,6 +761,8 @@ class WorkspaceResolver:
                 return Resolution(ids[0], 1.0, "local")
             current = self.symbols.get(current.parent_id) if current.parent_id else None
 
+        if file.language == "php":
+            return self._resolve_php_function(name, file)
         if file.language in NAMESPACE_LANGUAGES:
             own_type = self.enclosing_type(from_symbol)
             while own_type is not None:  # also outer types for nested classes
@@ -790,6 +797,32 @@ class WorkspaceResolver:
         if not top_level_candidates:
             return None
         return self._unique(top_level_candidates, 0.5, file.repo_id)
+
+    def _resolve_php_function(self, name: str, file: _File) -> Resolution | None:
+        """PHP: bare calls are functions: imported (``use function``), qualified, in the
+        file's namespace, or global."""
+        if "." in name:
+            ids = self.functions_by_qualified.get(name)
+            return Resolution(ids[0], 0.9, "import") if ids else None
+        for imp in file.imports:
+            if imp.kind == "using_function" and imp.alias == name:
+                ids = self.functions_by_qualified.get(imp.module)
+                return Resolution(ids[0], 0.9, "import") if ids else None
+        for namespace in file.namespaces:
+            ids = self.functions_by_qualified.get(f"{namespace}.{name}")
+            if ids:
+                return Resolution(ids[0], 0.9, "namespace")
+        ids = self.functions_by_qualified.get(name)
+        if ids:
+            return Resolution(
+                ids[0], 0.9, "local" if self.symbols[ids[0]].file_id == file.id else "import"
+            )
+        candidates = [
+            sid
+            for sid in self.callables_by_name.get(name, [])
+            if self.symbols[sid].kind == "function"
+        ]
+        return self._unique(candidates, 0.5, file.repo_id) if candidates else None
 
     def _unique_member(self, name: str, repo_id: int) -> Resolution | None:
         """Method/property ``name`` defined in exactly one type of the repository."""

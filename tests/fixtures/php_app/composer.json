@@ -1,0 +1,1 @@
+{ "name": "acme/shop", "autoload": { "psr-4": { "App\\": "app/" } } }
