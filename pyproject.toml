@@ -39,6 +39,7 @@ packages = ["src/wingman"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+norecursedirs = ["tests/fixtures"]  # sample repositories, not tests of wingman
 addopts = "-q"
 
 [tool.ruff]
