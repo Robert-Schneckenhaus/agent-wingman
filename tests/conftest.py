@@ -65,13 +65,16 @@ class IndexedWorkspace:
 
 
 def index_fixtures(tmp_path: Path, names) -> IndexedWorkspace:
-    """Copy fixture repositories to ``tmp_path`` and index them into a fresh DB."""
+    """Copy fixture repositories (names in tests/fixtures or directories) to
+    ``tmp_path`` and index them into a fresh DB."""
     engine = db.create_db_engine(f"sqlite:///{tmp_path / 'index.db'}")
     db.upgrade(engine)
+    sources = [FIXTURES / name if isinstance(name, str) else name for name in names]
+    names = [source.name for source in sources]
     with engine.begin() as conn:
         workspace_id = store.ensure_workspace(conn, "test")
-        for name in names:
-            shutil.copytree(FIXTURES / name, tmp_path / name)
+        for source, name in zip(sources, names, strict=True):
+            shutil.copytree(source, tmp_path / name)
             store.add_repository(conn, workspace_id, name, (tmp_path / name).as_posix())
     workspace = IndexedWorkspace(engine, workspace_id, tmp_path)
     for name in names:

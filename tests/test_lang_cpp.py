@@ -1,3 +1,5 @@
+import time
+
 from conftest import index_fixtures
 from sqlalchemy import select
 
@@ -64,3 +66,21 @@ def test_cpp_and_c_resolution(tmp_path):
             .where(refs.c.target_name.in_(["validate", "cancel", "round"]), refs.c.kind == "call")
         ).all()
     assert rows and all("declaration" not in (r[0] or []) for r in rows)
+
+
+def test_types_with_many_parts_resolve_quickly(tmp_path):
+    # e.g. spdlog: the same class in several #ifdef branches and a deep hierarchy; a
+    # plain base-type recursion visits parts^depth combinations
+    repo = tmp_path / "many"
+    repo.mkdir()
+    lines = []
+    for level in range(8):
+        base = f" : public L{level - 1}" if level else ""
+        body = "void root();" if level == 0 else ""
+        lines += [f"class L{level}{base} {{ public: {body} }};"] * 12
+    lines.append("void use(L7* x) { x->root(); x->missing(); }")
+    (repo / "many.h").write_text("\n".join(lines))
+    started = time.monotonic()
+    ws = index_fixtures(tmp_path / "ws", [repo])
+    assert time.monotonic() - started < 5
+    assert ws.calls()[("use", "root")] == "L0.root"

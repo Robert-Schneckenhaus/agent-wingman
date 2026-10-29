@@ -27,6 +27,8 @@ def test_php_resolution(tmp_path):
     # Laravel route -> controller action
     route = "POST /api/orders/{}/cancel"
     assert calls[(route, "cancel")] == "App.Http.Controllers.OrderController.cancel"
+    invokable = "App.Http.Controllers.ShowOrderController.__invoke"
+    assert calls[("GET /api/orders/{}", "__invoke")] == invokable
     assert calls[("OrderServiceTest.testCancel", "InMemoryOrderRepository")] == (
         "App.Repositories.InMemoryOrderRepository"
     )
@@ -35,4 +37,4 @@ def test_php_resolution(tmp_path):
     )
     with ws.engine.connect() as conn:
         routes = {(e.method, e.route) for e in endpoints.list_endpoints(conn, ws.workspace_id)}
-    assert routes == {("POST", "api/orders/{}/cancel")}
+    assert routes == {("POST", "api/orders/{}/cancel"), ("GET", "api/orders/{}")}

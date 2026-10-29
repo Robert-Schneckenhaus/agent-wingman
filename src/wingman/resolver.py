@@ -295,8 +295,9 @@ class WorkspaceResolver:
         for row in heritage:  # first, so member lookups can follow base types
             result = self.resolve_type(row.target_name, row.from_file_id, row.from_symbol_id)
             results[row.id] = result
-            if result is not None and row.from_symbol_id is not None:
-                self.bases[row.from_symbol_id].append(result.target)
+            bases = self.bases[row.from_symbol_id] if row.from_symbol_id is not None else None
+            if result is not None and bases is not None and result.target not in bases:
+                bases.append(result.target)
         for row in others:
             results[row.id] = self.resolve_ref(row)
 
@@ -711,20 +712,28 @@ class WorkspaceResolver:
         sym = self.symbols[type_id]
         return self.types_by_qualified.get(sym.qualified_name, [type_id])
 
-    def find_member(self, type_id: int, name: str, depth: int = 0) -> tuple[int, bool] | None:
-        """Member ``name`` of the type or its bases; returns (symbol, inherited)."""
-        if depth > MAX_DEPTH:
-            return None
-        group = self.type_group(type_id)
-        for part in group:
-            ids = self.members.get(part, {}).get(name)
-            if ids:
-                return ids[0], depth > 0
-        for part in group:
-            for base in self.bases.get(part, []):
-                found = self.find_member(base, name, depth + 1)
-                if found is not None:
-                    return found[0], True
+    def find_member(self, type_id: int, name: str) -> tuple[int, bool] | None:
+        """Member ``name`` of the type or its bases; returns (symbol, inherited).
+
+        Breadth-first, each type once: C++ templates and partial classes can give a
+        type many parts with the same bases, which a plain recursion explores
+        exponentially often."""
+        visited: set[int] = set()
+        frontier = [type_id]
+        for level in range(MAX_DEPTH + 1):
+            following: list[int] = []
+            for current in frontier:
+                for part in self.type_group(current):
+                    if part in visited:
+                        continue
+                    visited.add(part)
+                    ids = self.members.get(part, {}).get(name)
+                    if ids:
+                        return ids[0], level > 0
+                    following.extend(self.bases.get(part, ()))
+            if not following:
+                return None
+            frontier = following
         return None
 
     def _walk_chain(self, type_id: int, segments: list[str]) -> int | None:

@@ -492,6 +492,18 @@ class PhpExtractor(ExtractorBase):
         )
         self.out.endpoints.append(Endpoint("server", verb, route, index, self.line(node)))
         handler = args[1] if len(args) > 1 else None
+        if handler is not None and handler.type == "class_constant_access_expression":
+            # invokable controller: Route::get('/x', ShowController::class)
+            controller = self.text(handler).removesuffix("::class")
+            qualifier = php_name(controller).rsplit(".", 1)[-1]
+            self.add_ref(handler, "call", "__invoke", index, qualifier=qualifier)
+        elif handler is not None and handler.type in ("string", "encapsed_string"):
+            # Laravel < 8: Route::get('/x', 'OrderController@show')
+            target = self.string_value(handler, ctx) or ""
+            controller, _, action = target.partition("@")
+            if controller and action:
+                qualifier = php_name(controller).rsplit(".", 1)[-1]
+                self.add_ref(handler, "call", action, index, qualifier=qualifier)
         if handler is not None and handler.type == "array_creation_expression":
             parts = [e.named_children[0] for e in handler.named_children if e.named_children]
             if len(parts) == 2:
