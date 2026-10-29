@@ -17,6 +17,7 @@ from wingman import (
     context,
     docs,
     embeddings,
+    evaluation,
     git,
     hooks,
     notes,
@@ -700,6 +701,71 @@ def note_remove(app, note_id) -> None:
         except store.StoreError as exc:
             raise click.ClickException(str(exc)) from exc
     click.echo(f"Note #{note_id} removed.")
+
+
+# --- evaluation ----------------------------------------------------------------------
+
+
+@main.command("eval")
+@click.argument("repo_name")
+@click.option("--limit", "-n", default=30, show_default=True, help="Number of commits.")
+@click.option("--grep", "pattern", default=evaluation.DEFAULT_PATTERN, help="Commit message regex.")
+@click.option("-k", default=10, show_default=True, help="Context pack size.")
+@click.option("--max-files", default=8, show_default=True, help="Skip larger commits.")
+@click.option("--verbose", "-v", is_flag=True, help="Show every case.")
+@semantic_option
+@json_option
+@pass_app
+def eval_cmd(app, repo_name, limit, pattern, k, max_files, verbose, semantic, as_json) -> None:
+    """Measure how well context packs find the code changed by past bug fixes.
+
+    Each matching commit's message is used as a bug report; a hit is an entry in a
+    file (or symbol) the commit changed. Numbers are optimistic (the index already
+    contains the fix); use them to compare settings and versions."""
+    with app.engine.connect() as conn:
+        repos = {r.name: r for r in store.list_repositories(conn, app.workspace_id(conn))}
+    if repo_name not in repos:
+        raise click.ClickException(f"Unknown repository '{repo_name}'.")
+    root = Path(repos[repo_name].root_path)
+    try:
+        cases = evaluation.history_cases(root, limit=limit, pattern=pattern, max_files=max_files)
+    except RuntimeError as exc:
+        raise click.ClickException(f"Cannot read the git history of {root}: {exc}") from exc
+    if not cases:
+        raise click.ClickException("No matching commits (is the history shallow?).")
+    with app.engine.connect() as conn:
+        report = evaluation.evaluate(
+            conn,
+            app.workspace_id(conn),
+            repo_name,
+            cases,
+            k=k,
+            semantic=app.semantic_search if semantic else None,
+            progress=lambda m: click.echo(m, err=True),
+        )
+    _echo_warnings(app)
+    if as_json:
+        _echo_json(report.to_dict())
+        return
+    if verbose:
+        for r in report.results:
+            symbol = f"  symbol rank {r.symbol_rank or '-'}" if r.expected_symbols else ""
+            rank = r.file_rank or "-"
+            click.echo(f"{r.case.sha[:8]}  file rank {rank:>2}{symbol}  {r.case.subject[:70]}")
+
+    def fmt(value):
+        return "-" if value is None else f"{value:.2f}"
+
+    click.echo(f"{len(report.results)} commits, context packs of {k}")
+    for label, symbols in (("files  ", False), ("symbols", True)):
+        cases_label = f" ({report.symbol_cases} commits)" if symbols else ""
+        click.echo(
+            f"{label}  recall@1 {fmt(report.recall(1, symbols=symbols))}  "
+            f"@3 {fmt(report.recall(3, symbols=symbols))}  "
+            f"@5 {fmt(report.recall(5, symbols=symbols))}  "
+            f"@{k} {fmt(report.recall(k, symbols=symbols))}  "
+            f"MRR {fmt(report.mrr(symbols=symbols))}{cases_label}"
+        )
 
 
 # --- external documentation --------------------------------------------------------

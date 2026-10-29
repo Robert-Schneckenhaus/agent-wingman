@@ -34,6 +34,7 @@ uv venv && uv pip install -e ".[dev]"   # or: python -m venv .venv && pip instal
   SDK, bottom-up over the call graph, budget, `summary_cache`); tests use a fake summarizer
 - `src/wingman/docs.py` – external docs: loaders (Markdown/RST, HTML, PDF, OpenAPI, URLs),
   chunking, links to code (manual, name_match, route), doc search, docs for symbols
+- `src/wingman/evaluation.py` – `wingman eval`: bug-fix commits as queries, Recall@k/MRR
 - `src/wingman/render.py` – text output shared by CLI and MCP server
 - `src/wingman/notes.py` – notes on symbols/files/directories (keyed by stable keys)
 - `src/wingman/workspace.py` – config + engine access shared by CLI, MCP server, hooks

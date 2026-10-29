@@ -595,7 +595,7 @@ Der Prototyp ist auf **einen Entwickler mit lokaler SQLite-DB** ausgelegt. Das D
 | **6 – Externe Doku** ✅ | PDF/URL/MD/OpenAPI-Ingest, Chunking, Auto-Linking | Spezifikationen hängen am Code |
 | **7 – Breite** ✅ (ohne SCIP-Adapter) | JavaScript, dann Java, Python, PHP, dann **C/C++** (inkl. `compile_commands.json`, Header/Source-Zuordnung); SCIP/Roslyn/clang-Adapter; Notes | Alle Zielsprachen abgedeckt |
 | **8 – Teilen** | Export/Import-Format, CI-Build, PostgreSQL-Backend (siehe Abschnitt 10) | Team nutzt einen gemeinsamen Index |
-| **9 – Evaluation** | Benchmark: echte Issues/Commits, Recall@k der geänderten Dateien (läuft ab Phase 2 mit, wird hier ausgebaut) | Messbare Qualität, Tuning |
+| **9 – Evaluation** ✅ (Grundgerüst) | Benchmark: echte Issues/Commits, Recall@k der geänderten Dateien (läuft ab Phase 2 mit, wird hier ausgebaut) | Messbare Qualität, Tuning |
 
 ### Todo – für später vorgemerkt
 
@@ -616,6 +616,18 @@ Die gute Nachricht: Git-Historien liefern Ground Truth gratis. Für jeden Bugfix
 - **Recall@k** (Datei- und Symbolebene), **MRR**
 - **Token-Effizienz**: Wie viele Tokens braucht der Agent bis zur ersten richtigen Datei, mit und ohne wingman?
 - Indexing-Dauer und DB-Größe pro 100k LOC
+
+> *Umgesetzt (Phase 9, Grundgerüst):* `wingman eval <repo>` (`src/wingman/evaluation.py`). Testfälle sind die letzten Commits, deren Nachricht nach Bugfix klingt (`fix`, `bug`, `crash`, `wrong` …, Regex per `--grep`), die 1–8 indexierte Quelldateien ändern (ohne Tests) und mindestens drei aussagekräftige Wörter haben („Fixes #1082“ fällt raus). Die Nachricht ist die Anfrage, ein Treffer ist ein Eintrag im Context Pack in einer geänderten Datei. Für Dateien, die sich seit dem Commit nicht mehr geändert haben, stimmen die Zeilennummern des Diffs noch: Dort wird zusätzlich das innerste geänderte Symbol erwartet. Ausgabe: Recall@1/3/5/k und MRR für Dateien und Symbole, `--json` für Vergleiche. Einschränkung: Der Index enthält schon den Fix, und Commit-Nachrichten nennen oft Namen aus dem Code. Die Zahlen sind deshalb optimistisch und eher zum Vergleichen von Einstellungen und Versionen gedacht.
+
+**Messung mit `wingman eval`** (k = 10, Volltext vs. Volltext + Semantik mit `bge-small-en-v1.5`):
+
+| Repo | Commits | Datei-Recall@1 | Datei-Recall@10 | Datei-MRR | Symbol-MRR (Commits) |
+|------|---------|----------------|-----------------|-----------|----------------------|
+| dotnet/eShop | 22 | 0,41 → 0,50 | 0,82 → 0,77 | 0,55 → 0,58 | 0,27 → 0,35 (10) |
+| nestjs/nest | 40 | 0,33 → 0,50 | 0,75 → 0,82 | 0,45 → 0,59 | 0,29 → 0,41 (27) |
+| CleanArchitecture | 17 | 0,12 → 0,12 | 0,24 → 0,18 | 0,14 → 0,13 | 0,00 → 0,00 (4) |
+
+Semantik bringt bei eShop und nest vor allem den ersten Treffer nach vorn (Recall@1 +9 bzw. +17 Punkte). CleanArchitecture ist als Benchmark kaum brauchbar: Die Fix-Commits ändern überwiegend Template-, Projekt- und Build-Dateien, die Nachrichten beschreiben selten Verhalten.
 
 **Erste Messung (Phase 1, ohne Embeddings und LLM-Summaries):**
 

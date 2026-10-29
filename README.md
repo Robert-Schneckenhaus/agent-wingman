@@ -76,6 +76,7 @@ wingman tests TaxCalculator.Breakdown     # tests that reach a symbol (up to 3 c
 wingman note add TaxCalculator.Breakdown "Discount is applied before tax (#123)"
 wingman note add backend:src/Api "Controllers must call Audit()"
 wingman reindex src/billing/tax.ts        # single files, e.g. after a git checkout
+wingman eval backend -n 40 -v             # quality: past bug-fix commits as test cases
 ```
 
 ### Several repositories
