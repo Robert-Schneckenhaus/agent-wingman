@@ -1,5 +1,5 @@
 import json
-import shlex
+import sys
 
 import pytest
 
@@ -69,11 +69,13 @@ def test_install_local_merges_hooks_and_keeps_existing(tmp_path):
     settings = project / ".claude" / "settings.local.json"
     settings.parent.mkdir(parents=True)
     other = {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo other"}]}
+    # an entry written by an older version (shell form) is replaced, not duplicated
+    old = {"matcher": "Edit", "hooks": [{"type": "command", "command": "wingman hook post-edit"}]}
     settings.write_text(
-        json.dumps({"permissions": {"allow": []}, "hooks": {"PostToolUse": [other]}})
+        json.dumps({"permissions": {"allow": []}, "hooks": {"PostToolUse": [other, old]}})
     )
 
-    home = tmp_path / ".wingman"
+    home = tmp_path / "My Projects" / ".wingman"  # spaces need no quoting in exec form
     for _ in range(2):  # idempotent
         claude_setup.install(project, home, claude_md=True, register_mcp=False)
     data = json.loads(settings.read_text())
@@ -81,8 +83,9 @@ def test_install_local_merges_hooks_and_keeps_existing(tmp_path):
     post = data["hooks"]["PostToolUse"]
     assert post[0] == other
     assert len(post) == 2
-    command = shlex.split(post[1]["hooks"][0]["command"])
-    assert command[-4:] == ["--home", str(home), "hook", "post-edit"]
+    hook = post[1]["hooks"][0]
+    assert hook["command"] == sys.executable
+    assert hook["args"] == ["-m", "wingman", "--home", str(home), "hook", "post-edit"]
     assert len(data["hooks"]["SessionStart"]) == 1
     assert (project / "CLAUDE.md").read_text().count("<!-- wingman:start -->") == 1
 
@@ -101,9 +104,8 @@ def test_install_shared_writes_portable_config(tmp_path):
     mcp = json.loads((project / ".mcp.json").read_text())
     assert mcp == {"mcpServers": {"wingman": {"command": "wingman", "args": ["mcp"]}}}
     settings = json.loads((project / ".claude" / "settings.json").read_text())
-    assert settings["hooks"]["SessionStart"][0]["hooks"][0]["command"] == (
-        "wingman hook session-start"
-    )
+    hook = settings["hooks"]["SessionStart"][0]["hooks"][0]
+    assert (hook["command"], hook["args"]) == ("wingman", ["hook", "session-start"])
     assert "Existing text." in (project / "CLAUDE.md").read_text()
 
     claude_setup.uninstall(project, shared=True)

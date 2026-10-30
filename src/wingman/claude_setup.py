@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SERVER_NAME = "wingman"
-# identifies our hook entries in settings files
+# identifies our hook entries in settings files (exec form and older shell-form entries)
 _OUR_HOOK = re.compile(r"wingman\b.* hook (post-edit|session-start)$")
 CLAUDE_MD_START = "<!-- wingman:start -->"
 CLAUDE_MD_END = "<!-- wingman:end -->"
@@ -54,9 +54,13 @@ def base_command(home: Path | None, shared: bool) -> list[str]:
 
 def hook_settings(base: list[str]) -> dict:
     def entry(event: str) -> dict:
+        # Exec form (command + args): Claude Code starts the program directly, without
+        # a shell, so paths with spaces or backslashes need no quoting. In shell form
+        # Windows runs hooks through Git Bash or PowerShell, which quote differently.
         return {
             "type": "command",
-            "command": shlex.join([*base, "hook", event]),
+            "command": base[0],
+            "args": [*base[1:], "hook", event],
             "timeout": 120 if event == "session-start" else 60,
         }
 
@@ -68,8 +72,14 @@ def hook_settings(base: list[str]) -> dict:
     }
 
 
+def _hook_text(hook: dict) -> str:
+    args = hook.get("args")
+    command = str(hook.get("command", ""))
+    return shlex.join([command, *map(str, args)]) if isinstance(args, list) else command
+
+
 def _is_ours(group: dict) -> bool:
-    return any(_OUR_HOOK.search(str(h.get("command", ""))) for h in group.get("hooks", []))
+    return any(_OUR_HOOK.search(_hook_text(h)) for h in group.get("hooks", []))
 
 
 def merge_hooks(settings: dict, ours: dict) -> dict:
